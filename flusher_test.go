@@ -16,7 +16,7 @@ import (
 func newTestFlusher(t *testing.T, url string) (*flusher, *selfStats) {
 	t.Helper()
 	stats := newSelfStats()
-	cfg := Config{GatewayURL: url, FlushPath: "", APIKey: "k", ProjectID: "p"}
+	cfg := Config{GatewayURL: url, FlushPath: "", APIKey: "k"}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	f := newFlusher(make(chan Snapshot), cfg, log, stats)
 	f.ctx = context.Background()
@@ -43,7 +43,7 @@ func TestFlusherSuccess(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 			t.Fatalf("decode: %v", err)
 		}
-		if p.ProjectID != "p" || len(p.Metrics) != 1 {
+		if len(p.Metrics) != 1 {
 			t.Errorf("payload: %+v", p)
 		}
 		w.WriteHeader(http.StatusOK)

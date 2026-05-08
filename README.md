@@ -21,7 +21,7 @@ hop, never in the customer's request path.
 ## Why this exists
 
 The mesh0 backend ingest API (`/v1/traces`, `/v1/events`) is HTTPS — durable,
-authenticated, with `acks=all` to Redpanda before returning 200. That model
+authenticated, with `acks=all` to Redpanda before returning 200. That model`
 breaks down when you want to record millions of small counters/timings from
 PHP, where every page view is a fresh process and there's no in-process
 buffer to amortize HTTP calls against.
@@ -35,7 +35,6 @@ statsd / DogStatsD — but the wire to mesh0 is HTTPS, not UDP.
 ```bash
 docker run --rm \
   -e MESH0_API_KEY=m0_... \
-  -e MESH0_PROJECT_ID=$(uuidgen) \
   -p 8125:8125/udp \
   ghcr.io/mesh0-ai/metrics-agent:latest
 ```
@@ -65,8 +64,7 @@ spec:
         - name: mesh0-metrics-agent
           image: ghcr.io/mesh0-ai/metrics-agent:latest
           env:
-            - { name: MESH0_API_KEY,    valueFrom: { secretKeyRef: { name: mesh0, key: api-key } } }
-            - { name: MESH0_PROJECT_ID, valueFrom: { secretKeyRef: { name: mesh0, key: project-id } } }
+            - { name: MESH0_API_KEY, valueFrom: { secretKeyRef: { name: mesh0, key: api-key } } }
           ports:
             - { containerPort: 8125, protocol: UDP }
             - { containerPort: 8126, protocol: TCP }
@@ -121,8 +119,7 @@ All knobs are environment variables:
 
 | Variable                  | Default                      | Notes                                  |
 |---------------------------|------------------------------|----------------------------------------|
-| `MESH0_API_KEY`           | (required)                   | Per-project API key (`m0_…`).          |
-| `MESH0_PROJECT_ID`        | (required)                   | Project UUID metrics are billed to.    |
+| `MESH0_API_KEY`           | (required)                   | Per-project API key (`m0_…`); the gateway resolves the project from the key. |
 | `MESH0_GATEWAY_URL`       | `https://gateway.mesh0.ai`   | Override for self-hosted / staging.    |
 | `MESH0_FLUSH_PATH`        | `/v1/metrics`                | Path appended to gateway URL.          |
 | `MESH0_LISTEN_ADDR`       | `0.0.0.0:8125`               | UDP bind address.                      |

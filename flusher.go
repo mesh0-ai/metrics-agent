@@ -14,18 +14,16 @@ import (
 
 // flushPayload is the wire shape POSTed to gateway.mesh0.ai.
 type flushPayload struct {
-	ProjectID string          `json:"project_id"`
-	Source    string          `json:"source"`
-	Since     time.Time       `json:"since"`
-	Until     time.Time       `json:"until"`
-	Metrics   []FlushedMetric `json:"metrics"`
+	Source  string          `json:"source"`
+	Since   time.Time       `json:"since"`
+	Until   time.Time       `json:"until"`
+	Metrics []FlushedMetric `json:"metrics"`
 }
 
 type flusher struct {
 	in         <-chan Snapshot
 	url        string
 	apiKey     string
-	projectID  string
 	httpClient *http.Client
 	log        *slog.Logger
 	stats      *selfStats
@@ -36,10 +34,9 @@ type flusher struct {
 
 func newFlusher(in <-chan Snapshot, cfg Config, log *slog.Logger, stats *selfStats) *flusher {
 	return &flusher{
-		in:        in,
-		url:       cfg.GatewayURL + cfg.FlushPath,
-		apiKey:    cfg.APIKey,
-		projectID: cfg.ProjectID,
+		in:     in,
+		url:    cfg.GatewayURL + cfg.FlushPath,
+		apiKey: cfg.APIKey,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -73,11 +70,10 @@ func isRetryable(err error) bool {
 
 func (f *flusher) send(s Snapshot) {
 	payload := flushPayload{
-		ProjectID: f.projectID,
-		Source:    "mesh0-metrics-agent",
-		Since:     s.Since,
-		Until:     s.Until,
-		Metrics:   s.Metrics,
+		Source:  "mesh0-metrics-agent",
+		Since:   s.Since,
+		Until:   s.Until,
+		Metrics: s.Metrics,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

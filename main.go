@@ -19,7 +19,6 @@ var Version = "dev"
 // container ships with no flags to remember.
 type Config struct {
 	APIKey        string
-	ProjectID     string
 	GatewayURL    string
 	FlushPath     string
 	ListenAddr    string
@@ -32,7 +31,6 @@ type Config struct {
 func loadConfig() (Config, error) {
 	c := Config{
 		APIKey:        os.Getenv("MESH0_API_KEY"),
-		ProjectID:     os.Getenv("MESH0_PROJECT_ID"),
 		GatewayURL:    envOr("MESH0_GATEWAY_URL", "https://gateway.mesh0.ai"),
 		FlushPath:     envOr("MESH0_FLUSH_PATH", "/v1/metrics"),
 		ListenAddr:    envOr("MESH0_LISTEN_ADDR", "0.0.0.0:8125"),
@@ -72,9 +70,6 @@ func loadConfig() (Config, error) {
 	if c.APIKey == "" {
 		return c, errors.New("MESH0_API_KEY is required")
 	}
-	if c.ProjectID == "" {
-		return c, errors.New("MESH0_PROJECT_ID is required")
-	}
 	return c, nil
 }
 
@@ -102,7 +97,6 @@ func main() {
 		"listen", cfg.ListenAddr,
 		"gateway", cfg.GatewayURL+cfg.FlushPath,
 		"flush_interval", cfg.FlushInterval,
-		"project_id", cfg.ProjectID,
 	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
