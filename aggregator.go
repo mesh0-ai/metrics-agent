@@ -25,9 +25,10 @@ type gaugeAgg struct {
 }
 
 // timingAgg holds raw samples, capped to maxTimingSamples per series so a
-// noisy producer can't OOM the agent. When the cap is hit we reservoir-sample
-// (keep first N) — good enough for percentile signal in a 10s flush window
-// and orders of magnitude simpler than t-digest.
+// noisy producer can't OOM the agent. When the cap is hit we truncate (drop
+// further samples for this window). This biases percentiles toward the start
+// of the window, but in a 10s window with >10K samples the percentile signal
+// is still useful, and count/sum/min/max remain exact.
 type timingAgg struct {
 	tags    map[string]string
 	samples []float64
@@ -46,17 +47,19 @@ type aggregator struct {
 	in       <-chan Metric
 	flush    <-chan time.Time
 	out      chan<- Snapshot
+	stats    *selfStats
 	counters map[seriesKey]*counterAgg
 	gauges   map[seriesKey]*gaugeAgg
 	timings  map[seriesKey]*timingAgg
 	since    time.Time
 }
 
-func newAggregator(in <-chan Metric, flush <-chan time.Time, out chan<- Snapshot) *aggregator {
+func newAggregator(in <-chan Metric, flush <-chan time.Time, out chan<- Snapshot, stats *selfStats) *aggregator {
 	return &aggregator{
 		in:       in,
 		flush:    flush,
 		out:      out,
+		stats:    stats,
 		counters: make(map[seriesKey]*counterAgg),
 		gauges:   make(map[seriesKey]*gaugeAgg),
 		timings:  make(map[seriesKey]*timingAgg),
@@ -129,22 +132,27 @@ type Snapshot struct {
 }
 
 // FlushedMetric is the wire-shape for one series in one flush window.
-// Only fields relevant to the metric Type are populated.
+// Numeric fields use pointers so a zero is distinguishable from "not set":
+// counter=0, gauge=0, and timing min=0 are all valid values that must reach
+// the gateway, not be silently dropped by `omitempty` on a bare float64.
 type FlushedMetric struct {
 	Name       string            `json:"name"`
 	Type       string            `json:"type"`
 	Tags       map[string]string `json:"tags,omitempty"`
 	Timestamp  time.Time         `json:"timestamp"`
 	IntervalMs int64             `json:"interval_ms"`
-	Value      float64           `json:"value,omitempty"`
-	Count      uint64            `json:"count,omitempty"`
-	Sum        float64           `json:"sum,omitempty"`
-	Min        float64           `json:"min,omitempty"`
-	Max        float64           `json:"max,omitempty"`
-	P50        float64           `json:"p50,omitempty"`
-	P95        float64           `json:"p95,omitempty"`
-	P99        float64           `json:"p99,omitempty"`
+	Value      *float64          `json:"value,omitempty"`
+	Count      *uint64           `json:"count,omitempty"`
+	Sum        *float64          `json:"sum,omitempty"`
+	Min        *float64          `json:"min,omitempty"`
+	Max        *float64          `json:"max,omitempty"`
+	P50        *float64          `json:"p50,omitempty"`
+	P95        *float64          `json:"p95,omitempty"`
+	P99        *float64          `json:"p99,omitempty"`
 }
+
+func f64p(v float64) *float64 { return &v }
+func u64p(v uint64) *uint64   { return &v }
 
 func (a *aggregator) emit(now time.Time) {
 	intervalMs := now.Sub(a.since).Milliseconds()
@@ -160,7 +168,7 @@ func (a *aggregator) emit(now time.Time) {
 			Tags:       c.tags,
 			Timestamp:  a.since,
 			IntervalMs: intervalMs,
-			Value:      c.value,
+			Value:      f64p(c.value),
 		})
 	}
 	for k, g := range a.gauges {
@@ -170,7 +178,7 @@ func (a *aggregator) emit(now time.Time) {
 			Tags:       g.tags,
 			Timestamp:  now,
 			IntervalMs: intervalMs,
-			Value:      g.value,
+			Value:      f64p(g.value),
 		})
 	}
 	for k, t := range a.timings {
@@ -180,16 +188,16 @@ func (a *aggregator) emit(now time.Time) {
 			Tags:       t.tags,
 			Timestamp:  a.since,
 			IntervalMs: intervalMs,
-			Count:      t.count,
-			Sum:        t.sum,
-			Min:        t.min,
-			Max:        t.max,
+			Count:      u64p(t.count),
+			Sum:        f64p(t.sum),
+			Min:        f64p(t.min),
+			Max:        f64p(t.max),
 		}
 		if len(t.samples) > 0 {
 			sort.Float64s(t.samples)
-			fm.P50 = quantile(t.samples, 0.50)
-			fm.P95 = quantile(t.samples, 0.95)
-			fm.P99 = quantile(t.samples, 0.99)
+			fm.P50 = f64p(quantile(t.samples, 0.50))
+			fm.P95 = f64p(quantile(t.samples, 0.95))
+			fm.P99 = f64p(quantile(t.samples, 0.99))
 		}
 		out = append(out, fm)
 	}

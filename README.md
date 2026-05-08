@@ -69,6 +69,13 @@ spec:
             - { name: MESH0_PROJECT_ID, valueFrom: { secretKeyRef: { name: mesh0, key: project-id } } }
           ports:
             - { containerPort: 8125, protocol: UDP }
+            - { containerPort: 8126, protocol: TCP }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8126 }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8126 }
+            periodSeconds: 10
           resources:
             requests: { cpu: "10m",  memory: "16Mi" }
             limits:   { cpu: "200m", memory: "64Mi" }
@@ -118,9 +125,19 @@ All knobs are environment variables:
 | `MESH0_PROJECT_ID`        | (required)                   | Project UUID metrics are billed to.    |
 | `MESH0_GATEWAY_URL`       | `https://gateway.mesh0.ai`   | Override for self-hosted / staging.    |
 | `MESH0_FLUSH_PATH`        | `/v1/metrics`                | Path appended to gateway URL.          |
-| `MESH0_LISTEN_ADDR`       | `0.0.0.0:8125`               | Bind address.                          |
-| `MESH0_FLUSH_INTERVAL_MS` | `10000`                      | Min `1000`. Lower = more HTTP traffic. |
+| `MESH0_LISTEN_ADDR`       | `0.0.0.0:8125`               | UDP bind address.                      |
+| `MESH0_HEALTH_ADDR`       | `0.0.0.0:8126`               | HTTP health/stats bind. Empty disables.|
+| `MESH0_FLUSH_INTERVAL_MS` | `10000`                      | Range `[1000, 600000]`.                |
+| `MESH0_SHUTDOWN_GRACE_MS` | `15000`                      | Max wait for in-flight flushes on exit.|
 | `MESH0_LOG_LEVEL`         | `info`                       | `debug` \| `info` \| `warn` \| `error` |
+
+## Health & observability
+
+The agent exposes a small HTTP server on `MESH0_HEALTH_ADDR` (default `:8126`):
+
+- `GET /healthz` — returns `200 ok` once the agent is up. Use as k8s liveness/readiness.
+- `GET /stats` — JSON snapshot of internal counters (UDP packets received,
+  metrics parsed, parse errors, flush successes/failures, last flush time).
 
 ## Operational notes
 
