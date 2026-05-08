@@ -3,59 +3,16 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net/http"
 	"time"
 )
 
-// flushPayload is the wire shape POSTed to gateway.mesh0.ai.
-type flushPayload struct {
-	Source  string          `json:"source"`
-	Since   time.Time       `json:"since"`
-	Until   time.Time       `json:"until"`
-	Metrics []FlushedMetric `json:"metrics"`
-}
-
-type flusher struct {
-	in         <-chan Snapshot
-	url        string
-	apiKey     string
-	httpClient *http.Client
-	log        *slog.Logger
-	stats      *selfStats
-	// ctx bounds the lifetime of in-flight HTTP calls. Set by main; cancelled
-	// after the shutdown grace period so we don't outlive a SIGKILL.
-	ctx context.Context
-}
-
-func newFlusher(in <-chan Snapshot, cfg Config, log *slog.Logger, stats *selfStats) *flusher {
-	return &flusher{
-		in:     in,
-		url:    cfg.GatewayURL + cfg.FlushPath,
-		apiKey: cfg.APIKey,
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
-		log:   log,
-		stats: stats,
-		ctx:   context.Background(),
-	}
-}
-
-// run drains snapshots until `in` is closed, then returns. The producer
-// (main) closes `in` only after the aggregator has emitted its final
-// snapshot, so this loop guarantees the last flush window is sent.
-func (f *flusher) run() {
-	for s := range f.in {
-		f.send(s)
-	}
-}
-
-// retryableErr signals that the gateway response merits one more attempt
+// retryableErr signals that the gateway response merits another attempt
 // (5xx, 408, 429). 4xx other than those is a client problem retrying won't
 // fix.
 type retryableErr struct{ err error }
@@ -68,69 +25,21 @@ func isRetryable(err error) bool {
 	return errors.As(err, &re)
 }
 
-func (f *flusher) send(s Snapshot) {
-	payload := flushPayload{
-		Source:  "mesh0-metrics-agent",
-		Since:   s.Since,
-		Until:   s.Until,
-		Metrics: s.Metrics,
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		f.stats.FlushesFailed.Add(1)
-		f.log.Error("marshal flush payload", "err", err)
-		return
-	}
-
-	// One quick retry on transient failure (network or 5xx/408/429). The
-	// agent is fire-and-forget by design — we don't back up indefinitely.
-	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-time.After(500 * time.Millisecond):
-			case <-f.ctx.Done():
-				lastErr = f.ctx.Err()
-				goto done
-			}
-		}
-		err := f.postOnce(body)
-		if err == nil {
-			f.stats.FlushesOK.Add(1)
-			f.stats.MetricsFlushed.Add(uint64(len(s.Metrics)))
-			f.stats.LastFlushUnix.Store(time.Now().Unix())
-			f.log.Debug("flush ok", "metrics", len(s.Metrics), "attempt", attempt)
-			return
-		}
-		lastErr = err
-		if errors.Is(err, context.Canceled) {
-			break
-		}
-		if !isRetryable(err) {
-			break
-		}
-	}
-done:
-	f.stats.FlushesFailed.Add(1)
-	f.log.Warn("flush failed", "err", lastErr, "metrics", len(s.Metrics))
-}
-
-func (f *flusher) postOnce(body []byte) error {
-	ctx, cancel := context.WithTimeout(f.ctx, 10*time.Second)
+// postJSON performs a single POST with bearer auth. Returns *retryableErr for
+// transient failures (network, 5xx, 408, 429) so callers can decide to retry.
+func postJSON(parent context.Context, client *http.Client, url, apiKey string, body []byte) error {
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+f.apiKey)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("User-Agent", "mesh0-metrics-agent/"+Version)
 
-	resp, err := f.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		// Network errors are retryable unless the context was cancelled by
-		// shutdown — in that case, propagate context.Canceled untagged so
-		// the retry loop doesn't burn another attempt on a doomed call.
 		if errors.Is(err, context.Canceled) {
 			return err
 		}
@@ -147,4 +56,96 @@ func (f *flusher) postOnce(body []byte) error {
 		return &retryableErr{err: httpErr}
 	}
 	return httpErr
+}
+
+// eventsFlusher pulls EventBatch values off `in` and POSTs each as
+// {"events":[...]} to the configured events endpoint. Retries with
+// exponential backoff + jitter on 429/5xx/network up to MaxRetries, then
+// drops the batch and increments DropsFlushFailed.
+type eventsFlusher struct {
+	in         <-chan EventBatch
+	url        string
+	apiKey     string
+	httpClient *http.Client
+	log        *slog.Logger
+	stats      *selfStats
+	maxRetries int
+	ctx        context.Context
+
+	// rng is intentionally unsynchronised; only run() touches it.
+	rng *rand.Rand
+}
+
+func newEventsFlusher(in <-chan EventBatch, cfg Config, log *slog.Logger, stats *selfStats) *eventsFlusher {
+	return &eventsFlusher{
+		in:         in,
+		url:        cfg.GatewayURL + cfg.EventsPath,
+		apiKey:     cfg.APIKey,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+		log:        log,
+		stats:      stats,
+		maxRetries: cfg.MaxRetries,
+		ctx:        context.Background(),
+		rng:        rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+}
+
+func (f *eventsFlusher) run() {
+	for batch := range f.in {
+		f.send(batch)
+	}
+}
+
+// send POSTs one batch with retry/backoff. Drops the batch (and counts it as
+// flush_failed) once retries are exhausted or the context is cancelled.
+func (f *eventsFlusher) send(batch EventBatch) {
+	body := encodeEventBatch(batch)
+	var lastErr error
+
+	// Total attempts = 1 + maxRetries. Backoff base 250ms, doubling, capped
+	// at 5s; jitter scales by [0.5, 1.5) to spread retries across instances.
+	const baseBackoff = 250 * time.Millisecond
+	const maxBackoff = 5 * time.Second
+
+	for attempt := 0; attempt <= f.maxRetries; attempt++ {
+		if attempt > 0 {
+			d := baseBackoff << (attempt - 1)
+			if d > maxBackoff {
+				d = maxBackoff
+			}
+			jf := 0.5 + f.rng.Float64()
+			d = time.Duration(float64(d) * jf)
+			select {
+			case <-time.After(d):
+			case <-f.ctx.Done():
+				lastErr = f.ctx.Err()
+				goto fail
+			}
+		}
+		err := postJSON(f.ctx, f.httpClient, f.url, f.apiKey, body)
+		if err == nil {
+			f.stats.BatchesSent.Add(1)
+			f.stats.EventsSent.Add(uint64(len(batch.Events)))
+			f.stats.LastEventFlushMs.Store(time.Now().UnixMilli())
+			f.log.Debug("events flush ok",
+				"events", len(batch.Events),
+				"bytes", len(body),
+				"attempt", attempt,
+			)
+			return
+		}
+		lastErr = err
+		if errors.Is(err, context.Canceled) {
+			break
+		}
+		if !isRetryable(err) {
+			break
+		}
+	}
+fail:
+	f.stats.DropsFlushFailed.Add(uint64(len(batch.Events)))
+	f.log.Warn("events flush failed, dropping batch",
+		"events", len(batch.Events),
+		"err", lastErr,
+	)
 }
