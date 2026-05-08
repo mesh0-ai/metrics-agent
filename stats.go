@@ -10,15 +10,17 @@ import (
 // scraping logs. All fields are accessed via atomics so any goroutine can
 // update them on its hot path without locks.
 type selfStats struct {
-	EventsReceived   atomic.Uint64
-	EventsSent       atomic.Uint64
-	BatchesSent      atomic.Uint64
-	DropsParseError  atomic.Uint64
-	DropsQueueFull   atomic.Uint64
-	DropsOversize    atomic.Uint64
-	DropsFlushFailed atomic.Uint64
-	UDPReadErrors    atomic.Uint64
-	LastEventFlushMs atomic.Int64 // unix-millis of last successful event flush
+	EventsReceived    atomic.Uint64
+	EventsSent        atomic.Uint64
+	BatchesSent       atomic.Uint64
+	DropsParseError   atomic.Uint64
+	DropsQueueFull    atomic.Uint64
+	DropsOversize     atomic.Uint64
+	DropsFlushFailed  atomic.Uint64
+	DropsShutdown     atomic.Uint64
+	UDPReadErrors     atomic.Uint64
+	UDPBufferDegraded atomic.Bool  // kernel rejected the requested SO_RCVBUF
+	LastEventFlushMs  atomic.Int64 // unix-millis of last successful event flush
 
 	startUnix int64
 }
@@ -29,13 +31,14 @@ func newSelfStats() *selfStats {
 
 // statsSnapshot is the JSON shape of GET /stats.
 type statsSnapshot struct {
-	EventsReceived uint64    `json:"events_received"`
-	EventsDropped  dropStats `json:"events_dropped"`
-	BatchesSent    uint64    `json:"batches_sent"`
-	EventsSent     uint64    `json:"events_sent"`
-	LastFlushAgeMs int64     `json:"last_flush_age_ms"`
-	UDPReadErrors  uint64    `json:"udp_read_errors"`
-	UptimeS        int64     `json:"uptime_s"`
+	EventsReceived    uint64    `json:"events_received"`
+	EventsDropped     dropStats `json:"events_dropped"`
+	BatchesSent       uint64    `json:"batches_sent"`
+	EventsSent        uint64    `json:"events_sent"`
+	LastFlushAgeMs    int64     `json:"last_flush_age_ms"`
+	UDPReadErrors     uint64    `json:"udp_read_errors"`
+	UDPBufferDegraded bool      `json:"udp_buffer_degraded"`
+	UptimeS           int64     `json:"uptime_s"`
 }
 
 type dropStats struct {
@@ -43,6 +46,7 @@ type dropStats struct {
 	QueueFull   uint64 `json:"queue_full"`
 	Oversize    uint64 `json:"oversize"`
 	FlushFailed uint64 `json:"flush_failed"`
+	Shutdown    uint64 `json:"shutdown"`
 }
 
 func (s *selfStats) snapshot() statsSnapshot {
@@ -59,11 +63,13 @@ func (s *selfStats) snapshot() statsSnapshot {
 			QueueFull:   s.DropsQueueFull.Load(),
 			Oversize:    s.DropsOversize.Load(),
 			FlushFailed: s.DropsFlushFailed.Load(),
+			Shutdown:    s.DropsShutdown.Load(),
 		},
-		BatchesSent:    s.BatchesSent.Load(),
-		EventsSent:     s.EventsSent.Load(),
-		LastFlushAgeMs: ageMs,
-		UDPReadErrors:  s.UDPReadErrors.Load(),
-		UptimeS:        now.Unix() - s.startUnix,
+		BatchesSent:       s.BatchesSent.Load(),
+		EventsSent:        s.EventsSent.Load(),
+		LastFlushAgeMs:    ageMs,
+		UDPReadErrors:     s.UDPReadErrors.Load(),
+		UDPBufferDegraded: s.UDPBufferDegraded.Load(),
+		UptimeS:           now.Unix() - s.startUnix,
 	}
 }

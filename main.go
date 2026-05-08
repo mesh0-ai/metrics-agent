@@ -133,6 +133,10 @@ func main() {
 	batcher := newEventsBatcher(rawCh, batchCh, stats, log, cfg.MaxBatch, cfg.BatchWindow)
 	flush := newEventsFlusher(batchCh, cfg, log, stats)
 
+	flushCtx, flushCancel := context.WithCancel(context.Background())
+	flush.ctx = flushCtx
+	batcher.ctx = flushCtx
+
 	healthSrv := startHealthServer(cfg.HealthAddr, stats, log)
 
 	// Shutdown chain:
@@ -147,8 +151,6 @@ func main() {
 		close(batcherDone)
 	}()
 
-	flushCtx, flushCancel := context.WithCancel(context.Background())
-	flush.ctx = flushCtx
 	flushDone := make(chan struct{})
 	go func() {
 		flush.run()
@@ -167,21 +169,28 @@ func main() {
 	}
 
 	close(rawCh)
-	<-batcherDone
-	close(batchCh)
 
+	// Arm the grace timer before waiting on the batcher: if the flusher is
+	// wedged (slow POST + full batchCh), the batcher's final flush would
+	// block forever on send. Firing flushCancel after grace lets both the
+	// flusher's in-flight POST and the batcher's final flush abort, the
+	// latter accounting its events as drops.shutdown.
+	var graceTimer *time.Timer
 	if cfg.ShutdownGrace > 0 {
-		select {
-		case <-flushDone:
-		case <-time.After(cfg.ShutdownGrace):
+		graceTimer = time.AfterFunc(cfg.ShutdownGrace, func() {
 			log.Warn("shutdown grace exceeded, cancelling in-flight flushes",
 				"grace", cfg.ShutdownGrace)
 			flushCancel()
-			<-flushDone
-		}
+		})
 	} else {
 		flushCancel()
-		<-flushDone
+	}
+
+	<-batcherDone
+	close(batchCh)
+	<-flushDone
+	if graceTimer != nil {
+		graceTimer.Stop()
 	}
 	flushCancel()
 

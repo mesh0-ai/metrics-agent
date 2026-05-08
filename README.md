@@ -163,28 +163,40 @@ The agent exposes a small HTTP server on `MESH0_HEALTH_ADDR` (default `:8126`):
 
   ```json
   {
-    "events_received":   123456,
-    "events_dropped":    {"parse_error": 12, "queue_full": 3, "oversize": 0, "flush_failed": 0},
-    "batches_sent":      247,
-    "events_sent":       123087,
-    "last_flush_age_ms": 180,
-    "udp_read_errors":   0,
-    "uptime_s":          3600
+    "events_received":     123456,
+    "events_dropped":      {"parse_error": 12, "queue_full": 3, "oversize": 0, "flush_failed": 0, "shutdown": 0},
+    "batches_sent":        247,
+    "events_sent":         123087,
+    "last_flush_age_ms":   180,
+    "udp_read_errors":     0,
+    "udp_buffer_degraded": false,
+    "uptime_s":            3600
   }
   ```
 
+  - `events_dropped.shutdown` counts events abandoned when the shutdown
+    grace timer fires before the flusher finishes draining.
+  - `udp_buffer_degraded` is `true` if the kernel rejected the agent's
+    `SO_RCVBUF=8MB` request — investigate elevated NIC/socket-level loss
+    via `/proc/net/udp` if so.
+
 ## Loss model
 
-UDP is at-most-once. Three loss points, all observable in `/stats`:
+UDP is at-most-once. Four loss points, all observable in `/stats`:
 
 1. **Kernel UDP recv buffer** — mitigated by `SO_RCVBUF=8MB` set on
    startup. Drops at this layer are invisible to the agent — watch
-   `/proc/net/udp` `RcvbufErrors` if you suspect them.
+   `/proc/net/udp` `RcvbufErrors` if you suspect them, and check
+   `udp_buffer_degraded` in `/stats` to confirm the kernel accepted the
+   buffer request.
 2. **Agent queue full** (`drops.queue_full`) — internal `rawCh` is
    bounded by `MESH0_QUEUE_SIZE`. The listener never blocks; if the
    batcher is behind, the newest datagram is dropped.
 3. **Flush failures** (`drops.flush_failed`) — gateway 4xx (non-429),
    or 429/5xx after `MESH0_MAX_RETRIES`.
+4. **Shutdown grace exhausted** (`drops.shutdown`) — events still in
+   flight (or queued behind a wedged POST) when
+   `MESH0_SHUTDOWN_GRACE_MS` elapses are abandoned and counted.
 
 ## Build from source
 

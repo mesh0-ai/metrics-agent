@@ -37,6 +37,7 @@ func listen(ctx context.Context, addr string, out chan<- rawDatagram, log *slog.
 		return err
 	}
 	if err := conn.SetReadBuffer(readBufBytes); err != nil {
+		stats.UDPBufferDegraded.Store(true)
 		log.Warn("set udp read buffer failed", "err", err)
 	}
 	log.Info("udp listener started", "addr", conn.LocalAddr().String())
@@ -52,6 +53,12 @@ func listen(ctx context.Context, addr string, out chan<- rawDatagram, log *slog.
 		<-closerDone
 	}()
 
+	// readErrBackoff guards against a wedged socket spinning the loop at
+	// full speed. On every successful read it resets to zero; on a non-ctx
+	// error it grows from 10ms to a 1s ceiling.
+	const readErrBackoffCap = 1 * time.Second
+	var readErrBackoff time.Duration
+
 	for {
 		bp := readerPool.Get().(*[]byte)
 		buf := *bp
@@ -63,8 +70,22 @@ func listen(ctx context.Context, addr string, out chan<- rawDatagram, log *slog.
 			}
 			stats.UDPReadErrors.Add(1)
 			log.Warn("udp read error", "err", err)
+			if readErrBackoff == 0 {
+				readErrBackoff = 10 * time.Millisecond
+			} else if readErrBackoff < readErrBackoffCap {
+				readErrBackoff *= 2
+				if readErrBackoff > readErrBackoffCap {
+					readErrBackoff = readErrBackoffCap
+				}
+			}
+			select {
+			case <-time.After(readErrBackoff):
+			case <-ctx.Done():
+				return nil
+			}
 			continue
 		}
+		readErrBackoff = 0
 
 		// Copy bytes off the pooled buffer so the reader can reuse it
 		// immediately on the next iteration.

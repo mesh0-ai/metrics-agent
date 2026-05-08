@@ -114,6 +114,48 @@ func TestBatcherDropsParseError(t *testing.T) {
 	}
 }
 
+// TestBatcherFlushesAtByteCap verifies the byte-cap pre-flush at events.go
+// (the comparison is "would appending push us past MaxBatchBytes?"). A
+// regression that uses post-append size or inverts the comparison would
+// produce oversized POSTs that the gateway 413s.
+func TestBatcherFlushesAtByteCap(t *testing.T) {
+	// Build events whose validated form is just under MaxEventBytes (32KB)
+	// each. ~340 of them sum to >10MB (MaxBatchBytes).
+	in, out, _, _, done := newTestBatcher(t, 5000, 5*time.Second)
+	defer func() {
+		close(in)
+		<-done
+	}()
+
+	const perEvent = 30 * 1024
+	const want = (MaxBatchBytes / perEvent) + 5
+	pad := strings.Repeat("a", perEvent-32) // leave room for `{"k":"..."}`
+	for i := 0; i < want; i++ {
+		ev := []byte(`{"k":"` + pad + `"}`)
+		in <- rawDatagram{bytes: ev, at: time.Now()}
+	}
+
+	// At least one batch should arrive before the time window elapses,
+	// because the byte cap forces an early flush.
+	select {
+	case b := <-out:
+		// The pre-flush emits the *previous* contents, so the first batch
+		// must already be packed near (but not over) the byte cap.
+		var size int
+		for _, ev := range b.Events {
+			size += len(ev) + 1
+		}
+		if size > MaxBatchBytes {
+			t.Errorf("batch exceeds MaxBatchBytes: %d > %d", size, MaxBatchBytes)
+		}
+		if len(b.Events) == 0 {
+			t.Error("byte-cap flush emitted empty batch")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("byte-cap flush never fired before window")
+	}
+}
+
 func TestBatcherFinalFlushOnClose(t *testing.T) {
 	in, out, _, _, done := newTestBatcher(t, 500, 5*time.Second)
 	in <- dgFromObj(t, map[string]any{"a": 1})
@@ -128,6 +170,108 @@ func TestBatcherFinalFlushOnClose(t *testing.T) {
 	default:
 		t.Fatal("expected a final batch on shutdown")
 	}
+}
+
+// TestBatcherFinalFlushAbortsOnCtxCancel verifies that if the flusher is
+// wedged and batchCh is full, the batcher's final flush does not deadlock
+// — it observes ctx.Done() and accounts the dropped events as
+// drops.shutdown rather than blocking shutdown forever.
+func TestBatcherFinalFlushAbortsOnCtxCancel(t *testing.T) {
+	in := make(chan rawDatagram, 16)
+	// out has zero capacity and no consumer, so any send blocks.
+	out := make(chan EventBatch)
+	stats := newSelfStats()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b := newEventsBatcher(in, out, stats, log, 500, 5*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	b.ctx = ctx
+	done := make(chan struct{})
+	go func() {
+		b.run()
+		close(done)
+	}()
+
+	in <- dgFromObj(t, map[string]any{"a": 1})
+	in <- dgFromObj(t, map[string]any{"a": 2})
+	close(in)
+
+	// Cancel after a short delay so the batcher reaches its final flush
+	// and is blocked on `b.out <- batch`.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("batcher deadlocked on final flush despite ctx cancel")
+	}
+	if got := stats.DropsShutdown.Load(); got != 2 {
+		t.Errorf("drops.shutdown: got %d want 2", got)
+	}
+}
+
+// TestListenerDropsOnFullQueue is the regression guard for design priority
+// #1 ("never block the caller"). A saturated `out` channel must produce
+// drops.queue_full increments rather than stalling the read loop.
+func TestListenerDropsOnFullQueue(t *testing.T) {
+	stats := newSelfStats()
+	// Capacity 1, never drained — anything past the first send goes to
+	// the listener's `default` branch.
+	rawCh := make(chan rawDatagram, 1)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	addr := "127.0.0.1:0"
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probeConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chosenAddr := probeConn.LocalAddr().String()
+	probeConn.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = listen(ctx, chosenAddr, rawCh, log, stats)
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	cli, err := net.Dial("udp", chosenAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+
+	const N = 50
+	for i := 0; i < N; i++ {
+		if _, err := cli.Write([]byte(`{"i":1}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Poll for drops to accumulate; the listener is non-blocking and the
+	// kernel may drop some at the socket layer too, so we just need >0.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if stats.DropsQueueFull.Load() > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if stats.DropsQueueFull.Load() == 0 {
+		t.Fatalf("expected drops.queue_full > 0 after %d datagrams into a full channel", N)
+	}
+
+	cancel()
+	wg.Wait()
 }
 
 // TestListenerDispatchesJSON is an integration test that fires real UDP

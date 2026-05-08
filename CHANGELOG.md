@@ -18,6 +18,15 @@ All notable changes to this project are documented here.
 - Removed `MESH0_FLUSH_INTERVAL_MS`. The event path is configured via
   `MESH0_BATCH_WINDOW_MS` (default 200) and `MESH0_MAX_BATCH` (default 500).
 - Default flush endpoint is `/v1/events`; configurable via `MESH0_EVENTS_PATH`.
+- Stats snapshot adds `events_dropped.shutdown` (events abandoned because the
+  shutdown grace period expired with the flusher still wedged) and
+  `udp_buffer_degraded` (true when the kernel rejected the requested
+  `SO_RCVBUF`, signalling that elevated NIC/socket-level loss is plausible).
+- Listener now applies a brief exponential backoff (10ms → 1s) on repeated
+  non-cancellation read errors so a wedged socket cannot spin the goroutine.
+- Shutdown drain re-ordered so the grace timer arms before the batcher's
+  final flush. Previously a wedged HTTPS POST plus a full `batchCh` could
+  block the batcher's send forever and prevent shutdown from progressing.
 
 ## 0.1.0
 

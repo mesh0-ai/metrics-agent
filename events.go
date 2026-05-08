@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"sync"
@@ -137,6 +138,9 @@ type eventsBatcher struct {
 	log       *slog.Logger
 	maxEvents int
 	window    time.Duration
+	// ctx is checked when sending a batch downstream so a wedged flusher
+	// cannot deadlock the shutdown drain. nil is treated as never-cancelled.
+	ctx context.Context
 
 	cur       []json.RawMessage
 	curBytes  int
@@ -237,7 +241,19 @@ func (b *eventsBatcher) flush() {
 	b.cur = nil
 	b.curBytes = 0
 	b.firstSeen = time.Time{}
-	b.out <- batch
+	if b.ctx == nil {
+		b.out <- batch
+		return
+	}
+	select {
+	case b.out <- batch:
+	case <-b.ctx.Done():
+		// Flusher is gone or the grace timer fired during a wedged POST.
+		// Account for the dropped events instead of blocking forever.
+		b.stats.DropsShutdown.Add(uint64(len(batch.Events)))
+		b.log.Warn("batcher abandoning batch on shutdown",
+			"events", len(batch.Events))
+	}
 }
 
 // encodeEventBatch concatenates the wrapping object without re-marshalling
