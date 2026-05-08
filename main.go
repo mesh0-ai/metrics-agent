@@ -20,10 +20,13 @@ var Version = "dev"
 type Config struct {
 	APIKey        string
 	GatewayURL    string
-	FlushPath     string
+	EventsPath    string
 	ListenAddr    string
 	HealthAddr    string
-	FlushInterval time.Duration
+	BatchWindow   time.Duration
+	MaxBatch      int
+	QueueSize     int
+	MaxRetries    int
 	ShutdownGrace time.Duration
 	LogLevel      slog.Level
 }
@@ -31,20 +34,44 @@ type Config struct {
 func loadConfig() (Config, error) {
 	c := Config{
 		APIKey:        os.Getenv("MESH0_API_KEY"),
-		GatewayURL:    envOr("MESH0_GATEWAY_URL", "https://gateway.mesh0.ai"),
-		FlushPath:     envOr("MESH0_FLUSH_PATH", "/v1/metrics"),
-		ListenAddr:    envOr("MESH0_LISTEN_ADDR", "0.0.0.0:8125"),
-		HealthAddr:    envOr("MESH0_HEALTH_ADDR", "0.0.0.0:8126"),
-		FlushInterval: 10 * time.Second,
+		GatewayURL:    envOr("MESH0_BASE_URL", "https://api.mesh0.ai"),
+		EventsPath:    envOr("MESH0_EVENTS_PATH", "/v1/events"),
+		ListenAddr:    envOr("MESH0_LISTEN_ADDR", ":8125"),
+		HealthAddr:    envOr("MESH0_HEALTH_ADDR", ":8126"),
+		BatchWindow:   200 * time.Millisecond,
+		MaxBatch:      500,
+		QueueSize:     10_000,
+		MaxRetries:    4,
 		ShutdownGrace: 15 * time.Second,
 		LogLevel:      slog.LevelInfo,
 	}
-	if v := os.Getenv("MESH0_FLUSH_INTERVAL_MS"); v != "" {
+	if v := os.Getenv("MESH0_BATCH_WINDOW_MS"); v != "" {
 		ms, err := strconv.Atoi(v)
-		if err != nil || ms < 1000 || ms > 600_000 {
-			return c, fmt.Errorf("MESH0_FLUSH_INTERVAL_MS must be an integer in [1000, 600000]")
+		if err != nil || ms < 1 || ms > 60_000 {
+			return c, fmt.Errorf("MESH0_BATCH_WINDOW_MS must be an integer in [1, 60000]")
 		}
-		c.FlushInterval = time.Duration(ms) * time.Millisecond
+		c.BatchWindow = time.Duration(ms) * time.Millisecond
+	}
+	if v := os.Getenv("MESH0_MAX_BATCH"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > MaxEventsPerBatch {
+			return c, fmt.Errorf("MESH0_MAX_BATCH must be an integer in [1, %d]", MaxEventsPerBatch)
+		}
+		c.MaxBatch = n
+	}
+	if v := os.Getenv("MESH0_QUEUE_SIZE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return c, fmt.Errorf("MESH0_QUEUE_SIZE must be a positive integer")
+		}
+		c.QueueSize = n
+	}
+	if v := os.Getenv("MESH0_MAX_RETRIES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > 16 {
+			return c, fmt.Errorf("MESH0_MAX_RETRIES must be an integer in [0, 16]")
+		}
+		c.MaxRetries = n
 	}
 	if v := os.Getenv("MESH0_SHUTDOWN_GRACE_MS"); v != "" {
 		ms, err := strconv.Atoi(v)
@@ -80,11 +107,6 @@ func envOr(k, def string) string {
 	return def
 }
 
-// metricsBuffer is the staging chan between the UDP reader and the
-// aggregator. Sized to absorb burst traffic during a flush; if it fills,
-// the UDP reader will block and the kernel buffer drains next.
-const metricsBuffer = 100_000
-
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -95,35 +117,34 @@ func main() {
 	log.Info("starting mesh0 metrics agent",
 		"version", Version,
 		"listen", cfg.ListenAddr,
-		"gateway", cfg.GatewayURL+cfg.FlushPath,
-		"flush_interval", cfg.FlushInterval,
+		"endpoint", cfg.GatewayURL+cfg.EventsPath,
+		"batch_window", cfg.BatchWindow,
+		"max_batch", cfg.MaxBatch,
+		"queue_size", cfg.QueueSize,
 	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
 	stats := newSelfStats()
-	metricsCh := make(chan Metric, metricsBuffer)
-	snapshotCh := make(chan Snapshot, 4)
-	ticker := time.NewTicker(cfg.FlushInterval)
-	defer ticker.Stop()
+	rawCh := make(chan rawDatagram, cfg.QueueSize)
+	batchCh := make(chan EventBatch, 8)
 
-	agg := newAggregator(metricsCh, ticker.C, snapshotCh, stats)
-	flush := newFlusher(snapshotCh, cfg, log, stats)
+	batcher := newEventsBatcher(rawCh, batchCh, stats, log, cfg.MaxBatch, cfg.BatchWindow)
+	flush := newEventsFlusher(batchCh, cfg, log, stats)
 
 	healthSrv := startHealthServer(cfg.HealthAddr, stats, log)
 
-	// Shutdown is a chain of channel closes so no goroutine has to
-	// guess when its upstream is finished:
-	//   ctx -> listener returns -> close(metricsCh) -> aggregator emits
-	//   final snapshot and returns -> close(snapshotCh) -> flusher drains.
+	// Shutdown chain:
+	//   ctx -> listener returns -> close(rawCh) -> batcher emits final
+	//   batch and returns -> close(batchCh) -> flusher drains.
 	listenerErr := make(chan error, 1)
-	go func() { listenerErr <- listen(ctx, cfg.ListenAddr, metricsCh, log, stats) }()
+	go func() { listenerErr <- listen(ctx, cfg.ListenAddr, rawCh, log, stats) }()
 
-	aggDone := make(chan struct{})
+	batcherDone := make(chan struct{})
 	go func() {
-		agg.run()
-		close(aggDone)
+		batcher.run()
+		close(batcherDone)
 	}()
 
 	flushCtx, flushCancel := context.WithCancel(context.Background())
@@ -145,12 +166,10 @@ func main() {
 		cancel()
 	}
 
-	close(metricsCh)
-	<-aggDone
-	close(snapshotCh)
+	close(rawCh)
+	<-batcherDone
+	close(batchCh)
 
-	// Bound the time we wait for in-flight flushes; cancel the flusher's
-	// HTTP context if we exceed grace so we don't outlive k8s SIGKILL.
 	if cfg.ShutdownGrace > 0 {
 		select {
 		case <-flushDone:

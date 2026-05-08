@@ -1,47 +1,69 @@
 package main
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+	"time"
+)
 
 // selfStats holds counters describing the agent's own behavior. Exposed via
-// the health endpoint so operators can see drops, parse failures, and flush
-// outcomes without scraping logs. All fields are accessed via atomics so any
-// goroutine can update them on its hot path without locks.
+// the health endpoint so operators can see drops and flush outcomes without
+// scraping logs. All fields are accessed via atomics so any goroutine can
+// update them on its hot path without locks.
 type selfStats struct {
-	UDPPacketsReceived atomic.Uint64
-	MetricsParsed      atomic.Uint64
-	ParseErrors        atomic.Uint64
-	UDPReadErrors      atomic.Uint64
-	MetricsDropped     atomic.Uint64
-	FlushesOK          atomic.Uint64
-	FlushesFailed      atomic.Uint64
-	MetricsFlushed     atomic.Uint64
-	LastFlushUnix      atomic.Int64
+	EventsReceived   atomic.Uint64
+	EventsSent       atomic.Uint64
+	BatchesSent      atomic.Uint64
+	DropsParseError  atomic.Uint64
+	DropsQueueFull   atomic.Uint64
+	DropsOversize    atomic.Uint64
+	DropsFlushFailed atomic.Uint64
+	UDPReadErrors    atomic.Uint64
+	LastEventFlushMs atomic.Int64 // unix-millis of last successful event flush
+
+	startUnix int64
 }
 
-func newSelfStats() *selfStats { return &selfStats{} }
+func newSelfStats() *selfStats {
+	return &selfStats{startUnix: time.Now().Unix()}
+}
 
+// statsSnapshot is the JSON shape of GET /stats.
 type statsSnapshot struct {
-	UDPPacketsReceived uint64 `json:"udp_packets_received"`
-	MetricsParsed      uint64 `json:"metrics_parsed"`
-	ParseErrors        uint64 `json:"parse_errors"`
-	UDPReadErrors      uint64 `json:"udp_read_errors"`
-	MetricsDropped     uint64 `json:"metrics_dropped"`
-	FlushesOK          uint64 `json:"flushes_ok"`
-	FlushesFailed      uint64 `json:"flushes_failed"`
-	MetricsFlushed     uint64 `json:"metrics_flushed"`
-	LastFlushUnix      int64  `json:"last_flush_unix"`
+	EventsReceived uint64    `json:"events_received"`
+	EventsDropped  dropStats `json:"events_dropped"`
+	BatchesSent    uint64    `json:"batches_sent"`
+	EventsSent     uint64    `json:"events_sent"`
+	LastFlushAgeMs int64     `json:"last_flush_age_ms"`
+	UDPReadErrors  uint64    `json:"udp_read_errors"`
+	UptimeS        int64     `json:"uptime_s"`
+}
+
+type dropStats struct {
+	ParseError  uint64 `json:"parse_error"`
+	QueueFull   uint64 `json:"queue_full"`
+	Oversize    uint64 `json:"oversize"`
+	FlushFailed uint64 `json:"flush_failed"`
 }
 
 func (s *selfStats) snapshot() statsSnapshot {
+	now := time.Now()
+	lastMs := s.LastEventFlushMs.Load()
+	var ageMs int64
+	if lastMs > 0 {
+		ageMs = now.UnixMilli() - lastMs
+	}
 	return statsSnapshot{
-		UDPPacketsReceived: s.UDPPacketsReceived.Load(),
-		MetricsParsed:      s.MetricsParsed.Load(),
-		ParseErrors:        s.ParseErrors.Load(),
-		UDPReadErrors:      s.UDPReadErrors.Load(),
-		MetricsDropped:     s.MetricsDropped.Load(),
-		FlushesOK:          s.FlushesOK.Load(),
-		FlushesFailed:      s.FlushesFailed.Load(),
-		MetricsFlushed:     s.MetricsFlushed.Load(),
-		LastFlushUnix:      s.LastFlushUnix.Load(),
+		EventsReceived: s.EventsReceived.Load(),
+		EventsDropped: dropStats{
+			ParseError:  s.DropsParseError.Load(),
+			QueueFull:   s.DropsQueueFull.Load(),
+			Oversize:    s.DropsOversize.Load(),
+			FlushFailed: s.DropsFlushFailed.Load(),
+		},
+		BatchesSent:    s.BatchesSent.Load(),
+		EventsSent:     s.EventsSent.Load(),
+		LastFlushAgeMs: ageMs,
+		UDPReadErrors:  s.UDPReadErrors.Load(),
+		UptimeS:        now.Unix() - s.startUnix,
 	}
 }

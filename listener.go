@@ -4,7 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"net"
-	"strings"
+	"sync"
+	"time"
 )
 
 // readBufBytes is the kernel-side UDP receive buffer. Setting it large lets
@@ -12,12 +13,21 @@ import (
 // boundary; the agent's own goroutine drains it in a tight loop.
 const readBufBytes = 8 << 20 // 8MB
 
-// listen reads UDP datagrams on addr, splits them into newline-separated
-// statsd lines, parses each, and ships parsed metrics down `out`.
+// readerPool holds 64K scratch buffers reused across ReadFromUDP calls. The
+// listener never hands the pooled buffer itself downstream — bytes are copied
+// into a fresh slice before dispatch so the pooled buffer can be reused
+// immediately.
+var readerPool = sync.Pool{New: func() any { b := make([]byte, 64*1024); return &b }}
+
+// listen reads UDP datagrams on addr and forwards each as a rawDatagram to
+// `out`. Every datagram is treated as one candidate JSON event; structural
+// validation happens downstream in the batcher.
 //
-// On context cancel it closes the socket (which unblocks ReadFromUDP) and
-// returns once the read loop exits.
-func listen(ctx context.Context, addr string, out chan<- Metric, log *slog.Logger, stats *selfStats) error {
+// The listener never blocks on a full channel — it drops the newest datagram
+// and increments drops.queue_full so a slow flusher cannot stall the read
+// loop. On context cancel it closes the socket (which unblocks ReadFromUDP)
+// and returns once the read loop exits.
+func listen(ctx context.Context, addr string, out chan<- rawDatagram, log *slog.Logger, stats *selfStats) error {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return err
@@ -38,18 +48,16 @@ func listen(ctx context.Context, addr string, out chan<- Metric, log *slog.Logge
 		_ = conn.Close()
 	}()
 	defer func() {
-		// Ensure the close-on-cancel goroutine exits even when listen returns
-		// for non-ctx reasons (e.g., a permanent read error).
 		_ = conn.Close()
 		<-closerDone
 	}()
 
-	// Datagrams over loopback can be up to 64K. We size for headroom but
-	// real DogStatsD clients send <1500B; this is just defensive.
-	buf := make([]byte, 64*1024)
 	for {
+		bp := readerPool.Get().(*[]byte)
+		buf := *bp
 		n, _, err := conn.ReadFromUDP(buf)
 		if err != nil {
+			readerPool.Put(bp)
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -57,33 +65,21 @@ func listen(ctx context.Context, addr string, out chan<- Metric, log *slog.Logge
 			log.Warn("udp read error", "err", err)
 			continue
 		}
-		stats.UDPPacketsReceived.Add(1)
-		// One datagram may carry many \n-separated metrics.
-		payload := string(buf[:n])
-		for payload != "" {
-			var line string
-			if i := strings.IndexByte(payload, '\n'); i >= 0 {
-				line, payload = payload[:i], payload[i+1:]
-			} else {
-				line, payload = payload, ""
-			}
-			line = strings.TrimRight(line, "\r")
-			if line == "" {
-				continue
-			}
-			m, err := parseLine(line)
-			if err != nil {
-				stats.ParseErrors.Add(1)
-				log.Debug("malformed metric", "line", line)
-				continue
-			}
-			stats.MetricsParsed.Add(1)
-			// Don't deadlock if the aggregator is gone during shutdown.
-			select {
-			case out <- m:
-			case <-ctx.Done():
-				return nil
-			}
+
+		// Copy bytes off the pooled buffer so the reader can reuse it
+		// immediately on the next iteration.
+		payload := make([]byte, n)
+		copy(payload, buf[:n])
+		readerPool.Put(bp)
+
+		dg := rawDatagram{bytes: payload, at: time.Now()}
+		select {
+		case out <- dg:
+		case <-ctx.Done():
+			return nil
+		default:
+			// Non-blocking send: drop newest when the batcher is saturated.
+			stats.DropsQueueFull.Add(1)
 		}
 	}
 }

@@ -1,34 +1,77 @@
 # mesh0 metrics agent
 
-A small UDP/statsd sidecar that lets request-scoped runtimes (PHP, short-lived
-serverless functions, anything that can't keep a background flusher alive)
-ship high-frequency metrics to [mesh0](https://mesh0.ai) without blocking the
-hot request path.
+A small UDP → HTTPS event forwarder. Customers fire one JSON event per UDP
+datagram into `127.0.0.1:8125` and the agent batches them up and POSTs to
+`<MESH0_BASE_URL>/v1/events`. Authentication, TLS, batching, and retries
+happen once on the agent → mesh0 hop, never in the customer's request path.
 
 ```
-┌──────────────┐  UDP localhost:8125    ┌──────────────────┐  HTTPS batched
-│  app process │ ─────────────────────► │  mesh0 agent     │ ──────────────► gateway.mesh0.ai
-│  (any lang)  │   ~5µs per metric      │  (this binary)   │  flush every 10s
-└──────────────┘                        └──────────────────┘
+┌──────────────┐  UDP localhost:8125   ┌──────────────────┐  HTTPS batched
+│  app process │ ────────────────────► │  mesh0 agent     │ ──────────────► api.mesh0.ai
+│  (any lang)  │  one JSON event per   │  (this binary)   │  /v1/events
+└──────────────┘  datagram             └──────────────────┘  every ~200ms
 ```
-
-The app fires UDP datagrams in statsd / DogStatsD format to `127.0.0.1:8125`
-and returns immediately. The agent aggregates counters, gauges, and timings
-in memory and POSTs a compact JSON batch to the mesh0 gateway on a fixed
-interval. Authentication, TLS, and retries happen once on the agent → gateway
-hop, never in the customer's request path.
 
 ## Why this exists
 
-The mesh0 backend ingest API (`/v1/traces`, `/v1/events`) is HTTPS — durable,
-authenticated, with `acks=all` to Redpanda before returning 200. That model`
-breaks down when you want to record millions of small counters/timings from
-PHP, where every page view is a fresh process and there's no in-process
-buffer to amortize HTTP calls against.
+The mesh0 backend ingest API (`/v1/events`) is HTTPS — durable,
+authenticated. That model breaks down when you want to record millions of
+small events from PHP, where every page view is a fresh process and there's
+no in-process buffer to amortize HTTP calls against.
 
-This agent is the standard fix: push aggregation state out of the
-short-lived process and into a long-running sidecar. Same pattern as
-statsd / DogStatsD — but the wire to mesh0 is HTTPS, not UDP.
+This agent is the standard fix: push HTTPS state out of the short-lived
+process and into a long-running sidecar. The wire to your app is local UDP
+(at-most-once, fire-and-forget); the wire to mesh0 is HTTPS with retries.
+
+## Wire format (UDP → agent)
+
+One JSON object per UDP datagram, ≤ 32 KB. Anything that isn't a JSON
+object is dropped (`drops.parse_error`++); anything over 32 KB is dropped
+(`drops.oversize`++). The agent does not validate field-by-field — it
+forwards events as-is and fills `timestamp` with `now()` only if absent.
+
+Recommended fields, all optional:
+
+```
+timestamp        ISO-8601 string OR unix epoch number; agent fills if absent
+event_id         string
+trace_id         string
+span_id          string
+parent_span_id   string
+operation        string
+duration_ms      number
+status           "success" | "error"
+error_type       string
+error_message    string
+app_id           string
+environment      string
+user_id          string
+session_id       string
+tools            string[]
+attributes       object (free-form bag)
+messages         any
+model            { provider, id }
+usage            { prompt_tokens, completion_tokens, total_tokens, cost_usd }
+finish_reason    string
+prompt           { system, messages, prompt }
+```
+
+## Backend contract (agent → mesh0)
+
+```
+POST <MESH0_BASE_URL>/v1/events
+Authorization: Bearer <MESH0_API_KEY>
+Content-Type: application/json
+Body: {"events":[{...}, ...]}
+```
+
+- `200 {accepted: N}` — all good
+- `4xx` (other than 429) — log + drop batch, no retry
+- `429` / `5xx` — retry with exponential backoff + jitter
+  (250ms × 2^attempt, capped at 5s, ±50% jitter), drop after
+  `MESH0_MAX_RETRIES` and increment `drops.flush_failed`
+
+Server limits (matched client-side): batch ≤ 5000 events, body ≤ 10 MB.
 
 ## Quick start (Docker)
 
@@ -42,7 +85,8 @@ docker run --rm \
 From the app:
 
 ```bash
-echo -n "checkout.charge:1|c|#tier:pro" | nc -u -w0 127.0.0.1 8125
+echo -n '{"operation":"checkout.charge","duration_ms":42}' \
+  | nc -u -w0 127.0.0.1 8125
 ```
 
 ## Kubernetes sidecar
@@ -75,83 +119,72 @@ spec:
             httpGet: { path: /healthz, port: 8126 }
             periodSeconds: 10
           resources:
-            requests: { cpu: "10m",  memory: "16Mi" }
-            limits:   { cpu: "200m", memory: "64Mi" }
+            requests: { cpu: "10m",  memory: "32Mi" }
+            limits:   { cpu: "500m", memory: "128Mi" }
 ```
-
-The pod's other containers reach the agent over loopback — UDP never leaves
-the pod, so packet loss is a non-issue and there's no auth to wire up
-between the app and the agent.
 
 ## PHP example
 
 ```php
 $sock = socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
-$line = "checkout.charge:1|c|#tier:pro,region:us-east-1";
-socket_sendto($sock, $line, strlen($line), 0, '127.0.0.1', 8125);
+$evt  = json_encode([
+    "operation"   => "checkout.charge",
+    "duration_ms" => 42,
+    "status"      => "success",
+    "user_id"     => "u_42",
+]);
+socket_sendto($sock, $evt, strlen($evt), 0, '127.0.0.1', 8125);
 ```
-
-A thin composer package (`mesh0/metrics-php`) wraps this with timers,
-histograms, and tag handling — but the wire format is open and any
-existing statsd/DogStatsD client will work.
-
-## Wire format
-
-Standard statsd, with DogStatsD tag and sample-rate extensions:
-
-```
-metric.name:value|type[|@sample_rate][|#tag1:v1,tag2:v2]
-```
-
-| Type | Meaning                                      |
-|------|----------------------------------------------|
-| `c`  | counter — summed per series per flush window |
-| `g`  | gauge — last-write-wins per series           |
-| `ms` | timing in milliseconds                       |
-| `h`  | histogram (alias for `ms`)                   |
-| `d`  | distribution (alias for `ms`)                |
-
-Multiple metrics may share one packet, separated by `\n`.
 
 ## Configuration
 
-All knobs are environment variables:
+All knobs are environment variables.
 
-| Variable                  | Default                      | Notes                                  |
-|---------------------------|------------------------------|----------------------------------------|
-| `MESH0_API_KEY`           | (required)                   | Per-project API key (`m0_…`); the gateway resolves the project from the key. |
-| `MESH0_GATEWAY_URL`       | `https://gateway.mesh0.ai`   | Override for self-hosted / staging.    |
-| `MESH0_FLUSH_PATH`        | `/v1/metrics`                | Path appended to gateway URL.          |
-| `MESH0_LISTEN_ADDR`       | `0.0.0.0:8125`               | UDP bind address.                      |
-| `MESH0_HEALTH_ADDR`       | `0.0.0.0:8126`               | HTTP health/stats bind. Empty disables.|
-| `MESH0_FLUSH_INTERVAL_MS` | `10000`                      | Range `[1000, 600000]`.                |
-| `MESH0_SHUTDOWN_GRACE_MS` | `15000`                      | Max wait for in-flight flushes on exit.|
-| `MESH0_LOG_LEVEL`         | `info`                       | `debug` \| `info` \| `warn` \| `error` |
+| Variable                  | Default                | Notes                                      |
+|---------------------------|------------------------|--------------------------------------------|
+| `MESH0_API_KEY`           | (required)             | Per-project API key (`m0_…`).              |
+| `MESH0_BASE_URL`          | `https://api.mesh0.ai` | Override for self-hosted / staging.        |
+| `MESH0_EVENTS_PATH`       | `/v1/events`           | Path appended to base URL.                 |
+| `MESH0_LISTEN_ADDR`       | `:8125`                | UDP bind address.                          |
+| `MESH0_HEALTH_ADDR`       | `:8126`                | HTTP health/stats bind. Empty disables.    |
+| `MESH0_BATCH_WINDOW_MS`   | `200`                  | Max age of an event before its batch flushes. |
+| `MESH0_MAX_BATCH`         | `500`                  | Max events per batch (≤ 5000 server cap).  |
+| `MESH0_QUEUE_SIZE`        | `10000`                | UDP-side bounded queue depth.              |
+| `MESH0_MAX_RETRIES`       | `4`                    | Retry budget per batch on 429/5xx/network. |
+| `MESH0_SHUTDOWN_GRACE_MS` | `15000`                | Max wait for in-flight flushes on exit.    |
+| `MESH0_LOG_LEVEL`         | `info`                 | `debug` \| `info` \| `warn` \| `error`     |
 
 ## Health & observability
 
 The agent exposes a small HTTP server on `MESH0_HEALTH_ADDR` (default `:8126`):
 
-- `GET /healthz` — returns `200 ok` once the agent is up. Use as k8s liveness/readiness.
-- `GET /stats` — JSON snapshot of internal counters (UDP packets received,
-  metrics parsed, parse errors, flush successes/failures, last flush time).
+- `GET /healthz` — returns `200 ok` once the agent is up.
+- `GET /stats` — JSON snapshot:
 
-## Operational notes
+  ```json
+  {
+    "events_received":   123456,
+    "events_dropped":    {"parse_error": 12, "queue_full": 3, "oversize": 0, "flush_failed": 0},
+    "batches_sent":      247,
+    "events_sent":       123087,
+    "last_flush_age_ms": 180,
+    "udp_read_errors":   0,
+    "uptime_s":          3600
+  }
+  ```
 
-- **Aggregation is in-process and unreplicated.** If the agent crashes
-  between flushes, the current window is lost. Counters/gauges/timings are
-  not durable telemetry — use `/v1/events` for anything you need exactly
-  once.
-- **Cap on timing samples per series** is 10,000 per flush window. Beyond
-  that, percentiles are computed off the first 10K samples (count/sum/min/max
-  remain exact). Plenty for percentile signal at sub-minute flush windows.
-- **Resource floor** is ~10 MB RSS. CPU scales with metric line rate; on
-  a single core the parser does ~3M lines/sec.
-- **Drops on overload.** The internal channel between UDP reader and
-  aggregator is 100K deep. If the aggregator falls behind that far, the
-  reader blocks and the kernel buffer absorbs the next burst. Beyond the
-  kernel buffer, the OS drops UDP packets — a deliberate fire-and-forget
-  trade-off, not a bug.
+## Loss model
+
+UDP is at-most-once. Three loss points, all observable in `/stats`:
+
+1. **Kernel UDP recv buffer** — mitigated by `SO_RCVBUF=8MB` set on
+   startup. Drops at this layer are invisible to the agent — watch
+   `/proc/net/udp` `RcvbufErrors` if you suspect them.
+2. **Agent queue full** (`drops.queue_full`) — internal `rawCh` is
+   bounded by `MESH0_QUEUE_SIZE`. The listener never blocks; if the
+   batcher is behind, the newest datagram is dropped.
+3. **Flush failures** (`drops.flush_failed`) — gateway 4xx (non-429),
+   or 429/5xx after `MESH0_MAX_RETRIES`.
 
 ## Build from source
 
