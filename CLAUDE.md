@@ -12,7 +12,8 @@ only — no UDP, no TCP, no cross-host transport.
 The agent is deliberately a **pass-through batcher**, not a metrics
 aggregator. It does not parse statsd, compute quantiles, dedupe series, or
 inspect event field semantics. Every datagram is one candidate JSON object;
-the agent validates structure (must be a JSON object, ≤ 32 KB), stamps a
+the agent validates structure (must be a JSON object, ≤ `MESH0_MAX_EVENT_BYTES`,
+default 1 MB), stamps a
 `timestamp` if absent, and ships the original bytes verbatim inside
 `{"events":[...]}`. All semantic interpretation lives server-side.
 
