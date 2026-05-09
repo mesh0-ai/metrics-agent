@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## 0.3.0
+
+- Listener now also accepts **Unix domain sockets in datagram mode**
+  (`SOCK_DGRAM`). Set `MESH0_LISTEN_ADDR=unix:///run/mesh0/agent.sock`
+  (or `unixgram:///path`) to bind a UDS instead of UDP. Default remains
+  the UDP form (`:8125`); existing deployments are unaffected.
+- For UDS listeners the agent removes any stale socket file on startup
+  (idempotent restart), `chmod 0666` the bound socket so app processes
+  running as a different uid can write to it without uid alignment, and
+  unlinks the socket on graceful shutdown. A non-socket file at the bind
+  path is rejected rather than removed.
+- `parseListenAddr` validates the address at startup, so a malformed
+  `MESH0_LISTEN_ADDR` fails before any goroutine is spun up.
+
 ## 0.2.0
 
 - **BREAKING:** drops statsd protocol; agent now exclusively accepts JSON events on UDP.

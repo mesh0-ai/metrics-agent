@@ -1,16 +1,35 @@
 # mesh0 metrics agent
 
-A small UDP → HTTPS event forwarder. Customers fire one JSON event per UDP
-datagram into `127.0.0.1:8125` and the agent batches them up and POSTs to
+A small UDP/UDS → HTTPS event forwarder. Customers fire one JSON event per
+datagram at the agent (loopback UDP `127.0.0.1:8125` by default, or a Unix
+domain socket if you'd prefer); the agent batches and POSTs to
 `<MESH0_BASE_URL>/v1/events`. Authentication, TLS, batching, and retries
 happen once on the agent → mesh0 hop, never in the customer's request path.
 
 ```
-┌──────────────┐  UDP localhost:8125   ┌──────────────────┐  HTTPS batched
-│  app process │ ────────────────────► │  mesh0 agent     │ ──────────────► api.mesh0.ai
-│  (any lang)  │  one JSON event per   │  (this binary)   │  /v1/events
-└──────────────┘  datagram             └──────────────────┘  every ~200ms
+┌──────────────┐  UDP :8125 or          ┌──────────────────┐  HTTPS batched
+│  app process │  UDS-DGRAM /run/...  ► │  mesh0 agent     │ ──────────────► api.mesh0.ai
+│  (any lang)  │  one JSON event per    │  (this binary)   │  /v1/events
+└──────────────┘  datagram              └──────────────────┘  every ~200ms
 ```
+
+## Picking the wire: UDP vs UDS-DGRAM
+
+Both are fire-and-forget local transports — no connection, no ack, the
+caller never blocks. UDS-DGRAM is the better default whenever the app and
+the agent share a host (Kubernetes sidecar, the same VM):
+
+|                           | UDP             | UDS-DGRAM        |
+|---------------------------|-----------------|------------------|
+| Caller cost (per event)   | ~µs             | ~µs              |
+| Max single payload        | ~64 KB (IP frag) | configurable, often 200 KB+ |
+| Goes through IP stack     | yes             | no               |
+| Auth / scoping            | listen on lo    | filesystem perms |
+| Cross-host transport      | yes             | no — same host only |
+
+Stick with UDP if your app and the agent might be on different hosts (rare
+for sidecar deployments). Otherwise prefer UDS — bigger payloads, lossless
+on a healthy host, no port to coordinate.
 
 ## Why this exists
 
@@ -23,7 +42,7 @@ This agent is the standard fix: push HTTPS state out of the short-lived
 process and into a long-running sidecar. The wire to your app is local UDP
 (at-most-once, fire-and-forget); the wire to mesh0 is HTTPS with retries.
 
-## Wire format (UDP → agent)
+## Wire format (UDP / UDS-DGRAM → agent)
 
 One JSON object per UDP datagram, ≤ 32 KB. Anything that isn't a JSON
 object is dropped (`drops.parse_error`++); anything over 32 KB is dropped
@@ -125,6 +144,8 @@ spec:
 
 ## PHP example
 
+UDP:
+
 ```php
 $sock = socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
 $evt  = json_encode([
@@ -136,6 +157,20 @@ $evt  = json_encode([
 socket_sendto($sock, $evt, strlen($evt), 0, '127.0.0.1', 8125);
 ```
 
+UDS-DGRAM (PHP exposes Unix datagram sockets as `udg://`):
+
+```php
+$sock = stream_socket_client('udg:///run/mesh0/agent.sock');
+fwrite($sock, json_encode([
+    "operation"   => "checkout.charge",
+    "duration_ms" => 42,
+]));
+```
+
+The official mesh0 PHP SDK handles both transports — set
+`MESH0_AGENT_SOCKET=/run/mesh0/agent.sock` to switch the SDK's sinks
+from UDP to UDS-DGRAM with no code change.
+
 ## Configuration
 
 All knobs are environment variables.
@@ -145,7 +180,7 @@ All knobs are environment variables.
 | `MESH0_API_KEY`           | (required)             | Per-project API key (`m0_…`).              |
 | `MESH0_BASE_URL`          | `https://api.mesh0.ai` | Override for self-hosted / staging.        |
 | `MESH0_EVENTS_PATH`       | `/v1/events`           | Path appended to base URL.                 |
-| `MESH0_LISTEN_ADDR`       | `:8125`                | UDP bind address.                          |
+| `MESH0_LISTEN_ADDR`       | `:8125`                | Bind target. `host:port` (UDP) or `unix:///path` / `unixgram:///path` (UDS-DGRAM). |
 | `MESH0_HEALTH_ADDR`       | `:8126`                | HTTP health/stats bind. Empty disables.    |
 | `MESH0_BATCH_WINDOW_MS`   | `200`                  | Max age of an event before its batch flushes. |
 | `MESH0_MAX_BATCH`         | `500`                  | Max events per batch (≤ 5000 server cap).  |
@@ -182,11 +217,15 @@ The agent exposes a small HTTP server on `MESH0_HEALTH_ADDR` (default `:8126`):
 
 ## Loss model
 
-UDP is at-most-once. Four loss points, all observable in `/stats`:
+The local wire is at-most-once on UDP and best-effort on UDS-DGRAM
+(lossless on a healthy host but the kernel will still drop datagrams if
+the agent's recv buffer fills). Four loss points, all observable in
+`/stats`:
 
-1. **Kernel UDP recv buffer** — mitigated by `SO_RCVBUF=8MB` set on
-   startup. Drops at this layer are invisible to the agent — watch
-   `/proc/net/udp` `RcvbufErrors` if you suspect them, and check
+1. **Kernel recv buffer** — mitigated by `SO_RCVBUF=8MB` set on
+   startup (Linux applies it to both UDP and UDS-DGRAM). Drops at this
+   layer are invisible to the agent — watch `/proc/net/udp` (UDP) or
+   `/proc/net/unix` queue depth (UDS) if you suspect them, and check
    `udp_buffer_degraded` in `/stats` to confirm the kernel accepted the
    buffer request.
 2. **Agent queue full** (`drops.queue_full`) — internal `rawCh` is

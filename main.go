@@ -97,6 +97,11 @@ func loadConfig() (Config, error) {
 	if c.APIKey == "" {
 		return c, errors.New("MESH0_API_KEY is required")
 	}
+	// Fail fast on a malformed listen address so we don't crash a goroutine
+	// after startup just to surface a typo in env config.
+	if _, err := parseListenAddr(c.ListenAddr); err != nil {
+		return c, fmt.Errorf("MESH0_LISTEN_ADDR: %w", err)
+	}
 	return c, nil
 }
 
