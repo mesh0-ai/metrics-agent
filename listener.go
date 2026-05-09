@@ -36,6 +36,9 @@ func listen(ctx context.Context, path string, readBufSize int, out chan<- rawDat
 		return errors.New("MESH0_LISTEN_PATH is empty")
 	}
 	if readBufSize <= 0 {
+		// +1 vs. the validator cap so an exactly-cap-sized datagram still
+		// fits and an oversize one is read at boundary+1 and accounted via
+		// drops.oversize rather than silently truncated by the kernel.
 		readBufSize = DefaultMaxEventBytes + 1
 	}
 
@@ -45,9 +48,10 @@ func listen(ctx context.Context, path string, readBufSize int, out chan<- rawDat
 	}
 	defer cleanup()
 
-	// Per-listener pool sized to readBufSize. The listener never hands the
-	// pooled buffer itself downstream — bytes are copied into a fresh slice
-	// before dispatch so the pooled buffer can be reused immediately.
+	// Pool sized to the configured read buffer; one listener exists per
+	// process, so this effectively holds a single buffer reused across reads.
+	// The pooled buffer is never handed downstream — bytes are copied into a
+	// fresh slice before dispatch so the buffer can be reused immediately.
 	pool := sync.Pool{New: func() any { b := make([]byte, readBufSize); return &b }}
 
 	log.Info("listener started", "path", conn.LocalAddr().String(), "read_buf_bytes", readBufSize)

@@ -29,8 +29,10 @@ const MaxEventsPerBatch = 5000
 
 // MaxBatchBytes is the server-side body limit (10 MB). The batcher will
 // pre-flush if appending the next event would push us past this. With
-// MaxEventBytes near MaxBatchBytes, batches degrade to one event each —
-// expected, not a bug.
+// max_event_bytes near MaxBatchBytes batches degrade to one event each
+// (expected, not a bug); the effective per-event cap is
+// min(max_event_bytes, MaxBatchBytes), since a single event larger than
+// MaxBatchBytes would produce a one-event batch the gateway 413s.
 const MaxBatchBytes = 10 * 1024 * 1024
 
 // rawDatagram is one UDS-DGRAM payload destined for the JSON event path. The bytes

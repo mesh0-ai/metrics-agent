@@ -187,7 +187,7 @@ All knobs are environment variables.
 | `MESH0_HEALTH_ADDR`       | `:8126`                | HTTP health/stats bind. Empty disables.    |
 | `MESH0_BATCH_WINDOW_MS`   | `200`                  | Max age of an event before its batch flushes. |
 | `MESH0_MAX_BATCH`         | `500`                  | Max events per batch (≤ 5000 server cap).  |
-| `MESH0_MAX_EVENT_BYTES`   | `1048576` (1 MB)       | Per-datagram size ceiling. Range `[1024, 16777216]`. Datagrams larger than this are dropped (`drops.oversize`). The listener allocates a read buffer of this size + 1 byte per pooled slot; raising it enlarges the agent's resident memory floor. Senders (and on Linux, `net.core.{wmem,rmem}_max`) must also permit datagrams of this size. |
+| `MESH0_MAX_EVENT_BYTES`   | `1048576` (1 MB)       | Per-datagram size ceiling. Range `[1024, 16777216]`. Datagrams larger than this are dropped (`drops.oversize`). The listener allocates a single pooled read buffer of this size + 1 byte; raising it enlarges the agent's resident memory floor. Senders (and on Linux, `net.core.{wmem,rmem}_max`) must also permit datagrams of this size. |
 | `MESH0_QUEUE_SIZE`        | `10000`                | Listener-side bounded queue depth. Worst-case in-flight memory is `MESH0_QUEUE_SIZE × MESH0_MAX_EVENT_BYTES`; size accordingly. |
 | `MESH0_MAX_RETRIES`       | `4`                    | Retry budget per batch on 429/5xx/network. |
 | `MESH0_SHUTDOWN_GRACE_MS` | `15000`                | Max wait for in-flight flushes on exit.    |
