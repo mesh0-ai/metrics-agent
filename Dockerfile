@@ -12,6 +12,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/mesh0-metrics-agent /mesh0-metrics-agent
-EXPOSE 8125/udp
+# The agent listens on a Unix-domain socket (MESH0_LISTEN_PATH); only the
+# health server listens on TCP.
+EXPOSE 8126/tcp
 USER nonroot:nonroot
 ENTRYPOINT ["/mesh0-metrics-agent"]

@@ -46,7 +46,7 @@ func TestListenRoundTrip(t *testing.T) {
 	log := slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	listenErr := make(chan error, 1)
-	go func() { listenErr <- listen(ctx, sockPath, out, log, stats) }()
+	go func() { listenErr <- listen(ctx, sockPath, DefaultMaxEventBytes+1, out, log, stats) }()
 
 	if err := waitForSocket(sockPath, 500*time.Millisecond); err != nil {
 		t.Fatalf("socket not ready: %v", err)
@@ -126,7 +126,7 @@ func TestListenRemovesStaleSocket(t *testing.T) {
 	log := slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	listenErr := make(chan error, 1)
-	go func() { listenErr <- listen(ctx, sockPath, out, log, stats) }()
+	go func() { listenErr <- listen(ctx, sockPath, DefaultMaxEventBytes+1, out, log, stats) }()
 
 	if err := waitForSocket(sockPath, 500*time.Millisecond); err != nil {
 		t.Fatalf("socket not ready: %v", err)
@@ -151,7 +151,7 @@ func TestListenRejectsNonSocketFile(t *testing.T) {
 	stats := newSelfStats()
 	log := slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 
-	err := listen(ctx, path, out, log, stats)
+	err := listen(ctx, path, DefaultMaxEventBytes+1, out, log, stats)
 	if err == nil {
 		t.Fatal("expected error binding over a non-socket file")
 	}
@@ -160,22 +160,22 @@ func TestListenRejectsNonSocketFile(t *testing.T) {
 	}
 }
 
-// TestListenerOversizeOverWire fires a datagram larger than MaxEventBytes
-// at the real socket, and asserts the batcher records it as drops.oversize.
-// This closes the loop on the read-pool sizing — a future change that
-// shrinks the pooled buffer below MaxEventBytes would silently truncate
-// payloads instead of accounting them.
+// TestListenerOversizeOverWire fires a datagram larger than the configured
+// max-event-bytes at the real socket, and asserts the batcher records it as
+// drops.oversize. Uses a small (4 KB) cap so the test stays within macOS's
+// default unixgram size limit (2 KB → still skipped on Darwin) and avoids
+// kernel rmem_max headaches on Linux.
 func TestListenerOversizeOverWire(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("UDS-DGRAM not supported on Windows")
 	}
 	if runtime.GOOS == "darwin" {
 		// macOS caps unixgram datagrams at net.local.dgram.maxdgram (2048
-		// bytes by default) — well under MaxEventBytes (32KB), so we can't
-		// even send an oversize payload locally. CI is Linux; the
-		// regression guard runs there.
-		t.Skip("macOS caps unixgram datagram size below MaxEventBytes")
+		// bytes by default), below the 4 KB cap this test exercises. CI is
+		// Linux; the regression guard runs there.
+		t.Skip("macOS caps unixgram datagram size below test threshold")
 	}
+	const testMaxEventBytes = 4096
 	sockPath := shortTempSocketPath(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -187,19 +187,16 @@ func TestListenerOversizeOverWire(t *testing.T) {
 	log := slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	listenErr := make(chan error, 1)
-	go func() { listenErr <- listen(ctx, sockPath, rawCh, log, stats) }()
+	go func() { listenErr <- listen(ctx, sockPath, testMaxEventBytes+1, rawCh, log, stats) }()
 	if err := waitForSocket(sockPath, 500*time.Millisecond); err != nil {
 		t.Fatalf("socket not ready: %v", err)
 	}
 
 	// Drain rawCh through a real batcher so DropsOversize is incremented.
-	b := newEventsBatcher(rawCh, batchCh, stats, log, 500, 50*time.Millisecond)
+	b := newEventsBatcher(rawCh, batchCh, stats, log, 500, testMaxEventBytes, 50*time.Millisecond)
 	batchDone := make(chan struct{})
 	go func() { b.run(); close(batchDone) }()
 
-	// MUST_DGRAM_PAYLOAD_MAX on Linux defaults around 200KB+ for unixgram
-	// which is well over MaxEventBytes (32KB), so the kernel will deliver
-	// our oversize payload intact and the batcher will reject it.
 	cliAddr, err := net.ResolveUnixAddr("unixgram", sockPath)
 	if err != nil {
 		t.Fatal(err)
@@ -210,8 +207,7 @@ func TestListenerOversizeOverWire(t *testing.T) {
 	}
 	defer cli.Close()
 
-	// 40KB payload — well past MaxEventBytes (32KB), well under 64KB pool.
-	payload := append([]byte(`{"x":"`), make([]byte, 40*1024)...)
+	payload := append([]byte(`{"x":"`), make([]byte, testMaxEventBytes+512)...)
 	for i := 6; i < len(payload); i++ {
 		payload[i] = 'a'
 	}
@@ -242,7 +238,7 @@ func TestListenerOversizeOverWire(t *testing.T) {
 func TestListenRejectsEmptyPath(t *testing.T) {
 	stats := newSelfStats()
 	log := slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	if err := listen(context.Background(), "", make(chan rawDatagram, 1), log, stats); err == nil {
+	if err := listen(context.Background(), "", DefaultMaxEventBytes+1, make(chan rawDatagram, 1), log, stats); err == nil {
 		t.Fatal("expected error from empty path")
 	}
 }

@@ -12,7 +12,7 @@ import (
 
 func TestValidateEventOK(t *testing.T) {
 	in := []byte(`{"operation":"x","duration_ms":12}`)
-	out, reason := validateEvent(in)
+	out, reason := validateEvent(in, DefaultMaxEventBytes)
 	if reason != validateOK {
 		t.Fatalf("reason: %v", reason)
 	}
@@ -31,7 +31,7 @@ func TestValidateEventOK(t *testing.T) {
 
 func TestValidateEventPreservesExistingTimestamp(t *testing.T) {
 	in := []byte(`{"timestamp":"2024-01-01T00:00:00Z","op":"y"}`)
-	out, reason := validateEvent(in)
+	out, reason := validateEvent(in, DefaultMaxEventBytes)
 	if reason != validateOK {
 		t.Fatalf("reason: %v", reason)
 	}
@@ -53,7 +53,7 @@ func TestValidateEventRejectsNonObject(t *testing.T) {
 		`null`,
 	}
 	for _, c := range cases {
-		_, reason := validateEvent([]byte(c))
+		_, reason := validateEvent([]byte(c), DefaultMaxEventBytes)
 		if reason == validateOK {
 			t.Errorf("accepted non-object %q", c)
 		}
@@ -62,26 +62,43 @@ func TestValidateEventRejectsNonObject(t *testing.T) {
 
 func TestValidateEventRejectsMalformed(t *testing.T) {
 	in := []byte(`{not json`)
-	_, reason := validateEvent(in)
+	_, reason := validateEvent(in, DefaultMaxEventBytes)
 	if reason != validateParseError {
 		t.Errorf("expected parse error, got %v", reason)
 	}
 }
 
 func TestValidateEventOversize(t *testing.T) {
-	// 33KB payload — over the 32KB cap.
-	big := bytes.Repeat([]byte("a"), 33*1024)
+	// Payload one byte past the configured cap. Use a small maxBytes so the
+	// test stays fast and is decoupled from the package default.
+	const maxBytes = 4096
+	big := bytes.Repeat([]byte("a"), maxBytes)
 	in := append([]byte(`{"x":"`), big...)
 	in = append(in, []byte(`"}`)...)
-	_, reason := validateEvent(in)
+	_, reason := validateEvent(in, maxBytes)
 	if reason != validateOversize {
 		t.Errorf("expected oversize, got %v", reason)
 	}
 }
 
+func TestValidateEventBoundaryFits(t *testing.T) {
+	// A payload of exactly maxBytes is accepted (off-by-one guard).
+	const maxBytes = 4096
+	pad := bytes.Repeat([]byte("a"), maxBytes-len(`{"x":""}`))
+	in := append([]byte(`{"x":"`), pad...)
+	in = append(in, []byte(`"}`)...)
+	if len(in) != maxBytes {
+		t.Fatalf("test setup: input is %d bytes, want %d", len(in), maxBytes)
+	}
+	_, reason := validateEvent(in, maxBytes)
+	if reason != validateOK {
+		t.Errorf("expected OK at exact boundary, got %v", reason)
+	}
+}
+
 func TestValidateEventLeadingWhitespace(t *testing.T) {
 	in := []byte("  \n\t" + `{"a":1}` + "  \n")
-	out, reason := validateEvent(in)
+	out, reason := validateEvent(in, DefaultMaxEventBytes)
 	if reason != validateOK {
 		t.Fatalf("reason: %v", reason)
 	}

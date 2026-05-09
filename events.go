@@ -9,17 +9,28 @@ import (
 	"time"
 )
 
-// MaxEventBytes is the per-datagram size ceiling for a JSON event. Anything
-// larger is dropped (drops.oversize). Sized for typical agent traces with
-// modest message bodies; outliers should chunk.
-const MaxEventBytes = 32 * 1024
+// DefaultMaxEventBytes is the default per-datagram size ceiling for a JSON
+// event. Operators can override via MESH0_MAX_EVENT_BYTES; anything larger
+// than the configured value is dropped (drops.oversize). 1 MB is sized for
+// typical traces plus modest log lines; outliers should still chunk.
+const DefaultMaxEventBytes = 1 * 1024 * 1024
+
+// MinMaxEventBytes / MaxMaxEventBytes bound the configurable knob. The lower
+// bound keeps validateEvent meaningful; the upper bound caps worst-case
+// queue memory at MESH0_QUEUE_SIZE * MaxMaxEventBytes.
+const (
+	MinMaxEventBytes = 1024
+	MaxMaxEventBytes = 16 * 1024 * 1024
+)
 
 // MaxEventsPerBatch is the absolute server-side ceiling. The configurable
 // MESH0_MAX_BATCH must not exceed this.
 const MaxEventsPerBatch = 5000
 
 // MaxBatchBytes is the server-side body limit (10 MB). The batcher will
-// pre-flush if appending the next event would push us past this.
+// pre-flush if appending the next event would push us past this. With
+// MaxEventBytes near MaxBatchBytes, batches degrade to one event each —
+// expected, not a bug.
 const MaxBatchBytes = 10 * 1024 * 1024
 
 // rawDatagram is one UDS-DGRAM payload destined for the JSON event path. The bytes
@@ -47,11 +58,11 @@ const (
 )
 
 // validateEvent does structural validation only: must be a JSON object, must
-// fit under MaxEventBytes. Stamps a timestamp if absent. Returns the
+// fit under maxBytes. Stamps a timestamp if absent. Returns the
 // (possibly-rewritten) event bytes and a reason code; on validateOK the
 // returned slice is non-nil and ready to append to a batch.
-func validateEvent(b []byte) (json.RawMessage, validateReason) {
-	if len(b) > MaxEventBytes {
+func validateEvent(b []byte, maxBytes int) (json.RawMessage, validateReason) {
+	if len(b) > maxBytes {
 		return nil, validateOversize
 	}
 	if len(b) == 0 {
@@ -132,12 +143,13 @@ func injectTopLevelField(obj []byte, keyColon string, value []byte) []byte {
 // touches Events. Flush triggers: size cap, byte cap, or window timeout
 // since the first queued event in the current batch.
 type eventsBatcher struct {
-	in        <-chan rawDatagram
-	out       chan<- EventBatch
-	stats     *selfStats
-	log       *slog.Logger
-	maxEvents int
-	window    time.Duration
+	in            <-chan rawDatagram
+	out           chan<- EventBatch
+	stats         *selfStats
+	log           *slog.Logger
+	maxEvents     int
+	maxEventBytes int
+	window        time.Duration
 	// ctx is checked when sending a batch downstream so a wedged flusher
 	// cannot deadlock the shutdown drain. nil is treated as never-cancelled.
 	ctx context.Context
@@ -147,20 +159,24 @@ type eventsBatcher struct {
 	firstSeen time.Time
 }
 
-func newEventsBatcher(in <-chan rawDatagram, out chan<- EventBatch, stats *selfStats, log *slog.Logger, maxEvents int, window time.Duration) *eventsBatcher {
+func newEventsBatcher(in <-chan rawDatagram, out chan<- EventBatch, stats *selfStats, log *slog.Logger, maxEvents, maxEventBytes int, window time.Duration) *eventsBatcher {
 	if maxEvents <= 0 || maxEvents > MaxEventsPerBatch {
 		maxEvents = MaxEventsPerBatch
+	}
+	if maxEventBytes <= 0 {
+		maxEventBytes = DefaultMaxEventBytes
 	}
 	if window <= 0 {
 		window = 200 * time.Millisecond
 	}
 	return &eventsBatcher{
-		in:        in,
-		out:       out,
-		stats:     stats,
-		log:       log,
-		maxEvents: maxEvents,
-		window:    window,
+		in:            in,
+		out:           out,
+		stats:         stats,
+		log:           log,
+		maxEvents:     maxEvents,
+		maxEventBytes: maxEventBytes,
+		window:        window,
 	}
 }
 
@@ -202,7 +218,7 @@ func (b *eventsBatcher) run() {
 				b.flush()
 				return
 			}
-			ev, reason := validateEvent(dg.bytes)
+			ev, reason := validateEvent(dg.bytes, b.maxEventBytes)
 			switch reason {
 			case validateOversize:
 				b.stats.DropsOversize.Add(1)
