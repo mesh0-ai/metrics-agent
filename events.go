@@ -57,7 +57,27 @@ const (
 	validateOK validateReason = iota
 	validateOversize
 	validateParseError
+	validateUnknownField
 )
+
+// allowedTopLevelKeys mirrors the user-settable top-level fields in the
+// mesh0 ingest contract (see core/DATA_MODEL.md). The API runs
+// DisallowUnknownFields, so a single event with a stray key would 400 the
+// entire batch. We reject per-event here so one bad caller can't poison
+// thousands of good events. `project_id` is intentionally absent — it's
+// server-managed (assigned from the API key) and the API rejects it from
+// clients.
+var allowedTopLevelKeys = map[string]struct{}{
+	"event_id":       {},
+	"trace_id":       {},
+	"span_id":        {},
+	"parent_span_id": {},
+	"timestamp":      {},
+	"duration_ms":    {},
+	"status":         {},
+	"attributes":     {},
+	"data":           {},
+}
 
 // validateEvent does structural validation only: must be a JSON object, must
 // fit under maxBytes. Stamps a timestamp if absent. Returns the
@@ -85,7 +105,14 @@ func validateEvent(b []byte, maxBytes int) (json.RawMessage, validateReason) {
 	if !json.Valid(trimmed) {
 		return nil, validateParseError
 	}
-	if !hasTopLevelKey(trimmed, "timestamp") {
+	hasTimestamp, unknown, ok := inspectTopLevel(trimmed)
+	if !ok {
+		return nil, validateParseError
+	}
+	if unknown != "" {
+		return nil, validateUnknownField
+	}
+	if !hasTimestamp {
 		ts, err := json.Marshal(time.Now().UTC().Format(time.RFC3339Nano))
 		if err == nil {
 			trimmed = injectTopLevelField(trimmed, `"timestamp":`, ts)
@@ -94,35 +121,44 @@ func validateEvent(b []byte, maxBytes int) (json.RawMessage, validateReason) {
 	return json.RawMessage(trimmed), validateOK
 }
 
-func isJSONSpace(c byte) bool {
-	return c == ' ' || c == '\t' || c == '\r' || c == '\n'
-}
-
-// hasTopLevelKey decodes the object with json.Decoder so we correctly skip
-// nested objects and strings.
-func hasTopLevelKey(b []byte, key string) bool {
+// inspectTopLevel walks the object once: detects whether `timestamp` is set
+// and returns the first top-level key not in allowedTopLevelKeys (if any).
+// Returns ok=false on a structural decode failure (json.Valid should have
+// caught these, so this is defense-in-depth).
+func inspectTopLevel(b []byte) (hasTimestamp bool, unknownKey string, ok bool) {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	tok, err := dec.Token()
 	if err != nil {
-		return false
+		return false, "", false
 	}
-	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
-		return false
+	if delim, isDelim := tok.(json.Delim); !isDelim || delim != '{' {
+		return false, "", false
 	}
 	for dec.More() {
 		k, err := dec.Token()
 		if err != nil {
-			return false
+			return false, "", false
 		}
-		if ks, ok := k.(string); ok && ks == key {
-			return true
+		ks, isStr := k.(string)
+		if !isStr {
+			return false, "", false
+		}
+		if ks == "timestamp" {
+			hasTimestamp = true
+		}
+		if _, allowed := allowedTopLevelKeys[ks]; !allowed && unknownKey == "" {
+			unknownKey = ks
 		}
 		var raw json.RawMessage
 		if err := dec.Decode(&raw); err != nil {
-			return false
+			return false, "", false
 		}
 	}
-	return false
+	return hasTimestamp, unknownKey, true
+}
+
+func isJSONSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\r' || c == '\n'
 }
 
 // injectTopLevelField inserts `<keyColon><value>` as the first member of the
@@ -227,6 +263,9 @@ func (b *eventsBatcher) run() {
 				continue
 			case validateParseError:
 				b.stats.DropsParseError.Add(1)
+				continue
+			case validateUnknownField:
+				b.stats.DropsUnknownField.Add(1)
 				continue
 			}
 			if len(b.cur) > 0 && b.curBytes+len(ev)+1 > MaxBatchBytes {

@@ -28,7 +28,7 @@ func newTestEventsFlusher(t *testing.T, url string, maxRetries int) (*eventsFlus
 func sampleEventBatch(n int) EventBatch {
 	evs := make([]json.RawMessage, n)
 	for i := 0; i < n; i++ {
-		evs[i] = json.RawMessage(`{"operation":"test"}`)
+		evs[i] = json.RawMessage(`{"status":"success"}`)
 	}
 	return EventBatch{Events: evs, StartedAt: time.Unix(1700000000, 0)}
 }

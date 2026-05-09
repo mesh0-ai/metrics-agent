@@ -54,7 +54,7 @@ func TestBatcherFlushesAtMaxBatch(t *testing.T) {
 	// Fire 600 events. We expect at least one batch at the 500 boundary,
 	// and a remainder still buffered (drained on close).
 	for i := 0; i < 600; i++ {
-		in <- dgFromObj(t, map[string]any{"i": i})
+		in <- dgFromObj(t, map[string]any{"duration_ms": i})
 	}
 
 	var first EventBatch
@@ -74,8 +74,8 @@ func TestBatcherFlushesAtWindow(t *testing.T) {
 		close(in)
 		<-done
 	}()
-	in <- dgFromObj(t, map[string]any{"a": 1})
-	in <- dgFromObj(t, map[string]any{"a": 2})
+	in <- dgFromObj(t, map[string]any{"duration_ms": 1})
+	in <- dgFromObj(t, map[string]any{"duration_ms": 2})
 
 	select {
 	case b := <-out:
@@ -95,7 +95,7 @@ func TestBatcherDropsOversize(t *testing.T) {
 		<-done
 	}()
 	big := strings.Repeat("a", maxBytes+1)
-	by, _ := json.Marshal(map[string]any{"x": big})
+	by, _ := json.Marshal(map[string]any{"status": big})
 	in <- rawDatagram{bytes: by, at: time.Now()}
 	// Give the batcher a chance to process.
 	time.Sleep(100 * time.Millisecond)
@@ -133,9 +133,9 @@ func TestBatcherFlushesAtByteCap(t *testing.T) {
 
 	const perEvent = 30 * 1024
 	const want = (MaxBatchBytes / perEvent) + 5
-	pad := strings.Repeat("a", perEvent-32) // leave room for `{"k":"..."}`
+	pad := strings.Repeat("a", perEvent-len(`{"status":""}`))
 	for i := 0; i < want; i++ {
-		ev := []byte(`{"k":"` + pad + `"}`)
+		ev := []byte(`{"status":"` + pad + `"}`)
 		in <- rawDatagram{bytes: ev, at: time.Now()}
 	}
 
@@ -162,7 +162,7 @@ func TestBatcherFlushesAtByteCap(t *testing.T) {
 
 func TestBatcherFinalFlushOnClose(t *testing.T) {
 	in, out, _, _, done := newTestBatcher(t, 500, 5*time.Second)
-	in <- dgFromObj(t, map[string]any{"a": 1})
+	in <- dgFromObj(t, map[string]any{"duration_ms": 1})
 	close(in)
 	<-done
 
@@ -195,8 +195,8 @@ func TestBatcherFinalFlushAbortsOnCtxCancel(t *testing.T) {
 		close(done)
 	}()
 
-	in <- dgFromObj(t, map[string]any{"a": 1})
-	in <- dgFromObj(t, map[string]any{"a": 2})
+	in <- dgFromObj(t, map[string]any{"duration_ms": 1})
+	in <- dgFromObj(t, map[string]any{"duration_ms": 2})
 	close(in)
 
 	// Cancel after a short delay so the batcher reaches its final flush

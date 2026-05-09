@@ -72,7 +72,7 @@ func TestListenRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial unixgram: %v", err)
 	}
-	payload := []byte(`{"operation":"checkout.charge","duration_ms":42}`)
+	payload := []byte(`{"status":"success","duration_ms":42}`)
 	if _, err := cli.Write(payload); err != nil {
 		t.Fatalf("write datagram: %v", err)
 	}

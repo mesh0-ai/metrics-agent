@@ -4,6 +4,19 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- Agent now enforces the mesh0 ingest contract's top-level field set
+  per-event (`event_id`, `trace_id`, `span_id`, `parent_span_id`,
+  `timestamp`, `duration_ms`, `status`, `attributes`, `data`). Datagrams
+  with any other top-level key — including the legacy `operation`,
+  `model`, `usage`, `app_id`, etc. that previous SDKs put at the top
+  level, and the server-managed `project_id` — are dropped with a new
+  `events_dropped.unknown_field` counter. This mirrors the API's
+  `DisallowUnknownFields` check; rejecting at the agent isolates the
+  failure to the offending event instead of letting one bad datagram
+  400 the entire batch (≤5000 events). Move legacy fields into
+  `attributes` (queryable) or `data` (opaque).
+- New `/stats` field `events_dropped.unknown_field` (uint64). Update
+  any dashboards summing the drop categories.
 - Per-datagram size cap is now configurable via `MESH0_MAX_EVENT_BYTES`,
   with a new default of **1 MB** (was a hard-coded 32 KB). Range
   `[1 KB, 16 MB]`. Worst-case in-flight memory is `MESH0_QUEUE_SIZE ×

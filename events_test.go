@@ -11,7 +11,7 @@ import (
 // line parser).
 
 func TestValidateEventOK(t *testing.T) {
-	in := []byte(`{"operation":"x","duration_ms":12}`)
+	in := []byte(`{"status":"success","duration_ms":12}`)
 	out, reason := validateEvent(in, DefaultMaxEventBytes)
 	if reason != validateOK {
 		t.Fatalf("reason: %v", reason)
@@ -24,13 +24,13 @@ func TestValidateEventOK(t *testing.T) {
 	if _, ok := got["timestamp"]; !ok {
 		t.Errorf("expected timestamp injected, got %+v", got)
 	}
-	if got["operation"] != "x" {
-		t.Errorf("expected operation preserved, got %+v", got)
+	if got["status"] != "success" {
+		t.Errorf("expected status preserved, got %+v", got)
 	}
 }
 
 func TestValidateEventPreservesExistingTimestamp(t *testing.T) {
-	in := []byte(`{"timestamp":"2024-01-01T00:00:00Z","op":"y"}`)
+	in := []byte(`{"timestamp":"2024-01-01T00:00:00Z","status":"success"}`)
 	out, reason := validateEvent(in, DefaultMaxEventBytes)
 	if reason != validateOK {
 		t.Fatalf("reason: %v", reason)
@@ -73,7 +73,7 @@ func TestValidateEventOversize(t *testing.T) {
 	// test stays fast and is decoupled from the package default.
 	const maxBytes = 4096
 	big := bytes.Repeat([]byte("a"), maxBytes)
-	in := append([]byte(`{"x":"`), big...)
+	in := append([]byte(`{"status":"`), big...)
 	in = append(in, []byte(`"}`)...)
 	_, reason := validateEvent(in, maxBytes)
 	if reason != validateOversize {
@@ -84,8 +84,8 @@ func TestValidateEventOversize(t *testing.T) {
 func TestValidateEventBoundaryFits(t *testing.T) {
 	// A payload of exactly maxBytes is accepted (off-by-one guard).
 	const maxBytes = 4096
-	pad := bytes.Repeat([]byte("a"), maxBytes-len(`{"x":""}`))
-	in := append([]byte(`{"x":"`), pad...)
+	pad := bytes.Repeat([]byte("a"), maxBytes-len(`{"status":""}`))
+	in := append([]byte(`{"status":"`), pad...)
 	in = append(in, []byte(`"}`)...)
 	if len(in) != maxBytes {
 		t.Fatalf("test setup: input is %d bytes, want %d", len(in), maxBytes)
@@ -97,7 +97,7 @@ func TestValidateEventBoundaryFits(t *testing.T) {
 }
 
 func TestValidateEventLeadingWhitespace(t *testing.T) {
-	in := []byte("  \n\t" + `{"a":1}` + "  \n")
+	in := []byte("  \n\t" + `{"duration_ms":1}` + "  \n")
 	out, reason := validateEvent(in, DefaultMaxEventBytes)
 	if reason != validateOK {
 		t.Fatalf("reason: %v", reason)
@@ -107,39 +107,84 @@ func TestValidateEventLeadingWhitespace(t *testing.T) {
 	}
 }
 
-func TestHasTopLevelKeyIgnoresNested(t *testing.T) {
-	b := []byte(`{"x":{"timestamp":"nested"},"y":1}`)
-	if hasTopLevelKey(b, "timestamp") {
-		t.Error("matched nested timestamp")
+func TestInspectTopLevelIgnoresNested(t *testing.T) {
+	// A nested "timestamp" inside attributes must not be treated as a
+	// top-level timestamp; the unknown "x" outer key must be flagged.
+	b := []byte(`{"attributes":{"timestamp":"nested"},"x":1}`)
+	hasTs, unknown, ok := inspectTopLevel(b)
+	if !ok {
+		t.Fatal("expected ok")
 	}
-	if !hasTopLevelKey(b, "x") {
-		t.Error("missed top-level x")
+	if hasTs {
+		t.Error("matched nested timestamp as top-level")
 	}
-	if !hasTopLevelKey(b, "y") {
-		t.Error("missed top-level y")
+	if unknown != "x" {
+		t.Errorf("expected unknown=x, got %q", unknown)
 	}
 }
 
-// TestHasTopLevelKeyIgnoresStringContents guards against a regression to a
+// TestInspectTopLevelIgnoresStringContents guards against a regression to a
 // hand-rolled scanner: keys that appear inside string values (with or
 // without escaped quotes) must not be matched as top-level keys.
-func TestHasTopLevelKeyIgnoresStringContents(t *testing.T) {
+func TestInspectTopLevelIgnoresStringContents(t *testing.T) {
 	cases := []struct {
-		name string
-		in   string
-		key  string
-		want bool
+		name       string
+		in         string
+		wantHasTs  bool
+		wantUnknwn string // "" means none
 	}{
-		{"plain string value", `{"a":"timestamp inside","b":1}`, "timestamp", false},
-		{"escaped quotes inside string", `{"a":"has \"timestamp\" inside","b":1}`, "timestamp", false},
-		{"value contains key as substring", `{"name":"timestamp_field"}`, "timestamp", false},
-		{"actual top-level after decoy", `{"a":"timestamp","timestamp":"2024-01-01T00:00:00Z"}`, "timestamp", true},
+		{"plain string value", `{"status":"timestamp inside","duration_ms":1}`, false, ""},
+		{"escaped quotes inside string", `{"status":"has \"timestamp\" inside","duration_ms":1}`, false, ""},
+		{"value contains key as substring", `{"status":"timestamp_field"}`, false, ""},
+		{"actual top-level after decoy", `{"status":"timestamp","timestamp":"2024-01-01T00:00:00Z"}`, true, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := hasTopLevelKey([]byte(tc.in), tc.key); got != tc.want {
-				t.Errorf("hasTopLevelKey(%q, %q) = %v, want %v", tc.in, tc.key, got, tc.want)
+			hasTs, unknown, ok := inspectTopLevel([]byte(tc.in))
+			if !ok {
+				t.Fatal("expected ok")
+			}
+			if hasTs != tc.wantHasTs {
+				t.Errorf("hasTs=%v, want %v", hasTs, tc.wantHasTs)
+			}
+			if unknown != tc.wantUnknwn {
+				t.Errorf("unknown=%q, want %q", unknown, tc.wantUnknwn)
 			}
 		})
+	}
+}
+
+// TestValidateEventRejectsUnknownTopLevelKey ensures we fail per-event when
+// a caller sends a key not in the mesh0 ingest contract — the API would 400
+// the entire batch otherwise (DisallowUnknownFields).
+func TestValidateEventRejectsUnknownTopLevelKey(t *testing.T) {
+	cases := []string{
+		`{"operation":"x"}`,                  // legacy field, no longer top-level
+		`{"status":"success","app_id":"a"}`,  // mixed valid + unknown
+		`{"model":{"id":"gpt-4"}}`,           // legacy nested unknown
+		`{"project_id":"00000000-0000-0000-0000-000000000000"}`, // server-managed
+	}
+	for _, c := range cases {
+		t.Run(c, func(t *testing.T) {
+			_, reason := validateEvent([]byte(c), DefaultMaxEventBytes)
+			if reason != validateUnknownField {
+				t.Errorf("expected unknown-field reject for %s, got %v", c, reason)
+			}
+		})
+	}
+}
+
+// TestValidateEventAcceptsAllAllowedKeys ensures every documented top-level
+// field passes structural validation. Failing this means an SDK update made
+// the agent stricter than the API.
+func TestValidateEventAcceptsAllAllowedKeys(t *testing.T) {
+	in := []byte(`{` +
+		`"event_id":"e","trace_id":"t","span_id":"s","parent_span_id":"p",` +
+		`"timestamp":"2024-01-01T00:00:00Z","duration_ms":1,"status":"success",` +
+		`"attributes":{"k":"v"},"data":{"big":"payload"}` +
+		`}`)
+	_, reason := validateEvent(in, DefaultMaxEventBytes)
+	if reason != validateOK {
+		t.Errorf("expected OK, got %v", reason)
 	}
 }

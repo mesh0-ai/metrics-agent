@@ -13,11 +13,12 @@ type selfStats struct {
 	EventsReceived   atomic.Uint64
 	EventsSent       atomic.Uint64
 	BatchesSent      atomic.Uint64
-	DropsParseError  atomic.Uint64
-	DropsQueueFull   atomic.Uint64
-	DropsOversize    atomic.Uint64
-	DropsFlushFailed atomic.Uint64
-	DropsShutdown    atomic.Uint64
+	DropsParseError   atomic.Uint64
+	DropsQueueFull    atomic.Uint64
+	DropsOversize     atomic.Uint64
+	DropsUnknownField atomic.Uint64
+	DropsFlushFailed  atomic.Uint64
+	DropsShutdown     atomic.Uint64
 	ReadErrors       atomic.Uint64
 	BufferDegraded   atomic.Bool  // kernel rejected the requested SO_RCVBUF
 	ListenerFatal    atomic.Bool  // listener goroutine exited unexpectedly
@@ -44,11 +45,12 @@ type statsSnapshot struct {
 }
 
 type dropStats struct {
-	ParseError  uint64 `json:"parse_error"`
-	QueueFull   uint64 `json:"queue_full"`
-	Oversize    uint64 `json:"oversize"`
-	FlushFailed uint64 `json:"flush_failed"`
-	Shutdown    uint64 `json:"shutdown"`
+	ParseError   uint64 `json:"parse_error"`
+	QueueFull    uint64 `json:"queue_full"`
+	Oversize     uint64 `json:"oversize"`
+	UnknownField uint64 `json:"unknown_field"`
+	FlushFailed  uint64 `json:"flush_failed"`
+	Shutdown     uint64 `json:"shutdown"`
 }
 
 func (s *selfStats) snapshot() statsSnapshot {
@@ -61,11 +63,12 @@ func (s *selfStats) snapshot() statsSnapshot {
 	return statsSnapshot{
 		EventsReceived: s.EventsReceived.Load(),
 		EventsDropped: dropStats{
-			ParseError:  s.DropsParseError.Load(),
-			QueueFull:   s.DropsQueueFull.Load(),
-			Oversize:    s.DropsOversize.Load(),
-			FlushFailed: s.DropsFlushFailed.Load(),
-			Shutdown:    s.DropsShutdown.Load(),
+			ParseError:   s.DropsParseError.Load(),
+			QueueFull:    s.DropsQueueFull.Load(),
+			Oversize:     s.DropsOversize.Load(),
+			UnknownField: s.DropsUnknownField.Load(),
+			FlushFailed:  s.DropsFlushFailed.Load(),
+			Shutdown:     s.DropsShutdown.Load(),
 		},
 		BatchesSent:    s.BatchesSent.Load(),
 		EventsSent:     s.EventsSent.Load(),

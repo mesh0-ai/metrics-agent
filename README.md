@@ -52,34 +52,34 @@ to mesh0 is HTTPS with retries.
 One JSON object per datagram, ≤ `MESH0_MAX_EVENT_BYTES` (default 1 MB,
 range `[1 KB, 16 MB]`). Anything that isn't a JSON object is dropped
 (`drops.parse_error`++); anything over the configured cap is dropped
-(`drops.oversize`++). The agent does not validate field-by-field — it
-forwards events as-is and fills `timestamp` with `now()` only if absent.
+(`drops.oversize`++). The agent fills `timestamp` with `now()` only if
+absent.
 
-Recommended fields, all optional:
+The agent enforces the mesh0 ingest contract's top-level field set
+(see [core/DATA_MODEL.md](../core/DATA_MODEL.md)). Datagrams with any
+top-level key not in the table below are dropped per-event with
+`drops.unknown_field`++. This matches the API's `DisallowUnknownFields`
+check; rejecting at the agent stops one bad event from 400-ing the whole
+batch.
+
+Allowed top-level fields (all optional unless noted):
 
 ```
-timestamp        ISO-8601 string OR unix epoch number; agent fills if absent
-event_id         string
-trace_id         string
-span_id          string
-parent_span_id   string
-operation        string
-duration_ms      number
-status           "success" | "error"
-error_type       string
-error_message    string
-app_id           string
-environment      string
-user_id          string
-session_id       string
-tools            string[]
-attributes       object (free-form bag)
-messages         any
-model            { provider, id }
-usage            { prompt_tokens, completion_tokens, total_tokens, cost_usd }
-finish_reason    string
-prompt           { system, messages, prompt }
+event_id         string  — server-generated if omitted (carries dedup token)
+trace_id         string  — auto-hex if omitted
+span_id          string  — auto-hex if omitted
+parent_span_id   string  — empty for root events
+timestamp        ISO-8601 string OR epoch-ms; agent fills if absent
+duration_ms      number  — uint32; defaults to 0 server-side
+status           string  — convention: "success" | "error"
+attributes       object  — queryable in TQL; promotable to typed columns
+data             object  — opaque payload, not TQL-queryable
 ```
+
+Anything else (`operation`, `model`, `usage`, `user_id`, `environment`,
+…) must live inside `attributes` or `data`. `project_id` is
+server-managed (assigned from the API key) and will be rejected by the
+agent if a client sets it.
 
 ## Backend contract (agent → mesh0)
 
@@ -203,7 +203,7 @@ The agent exposes a small HTTP server on `MESH0_HEALTH_ADDR` (default `:8126`):
   ```json
   {
     "events_received":   123456,
-    "events_dropped":    {"parse_error": 12, "queue_full": 3, "oversize": 0, "flush_failed": 0, "shutdown": 0},
+    "events_dropped":    {"parse_error": 12, "queue_full": 3, "oversize": 0, "unknown_field": 0, "flush_failed": 0, "shutdown": 0},
     "batches_sent":      247,
     "events_sent":       123087,
     "last_flush_age_ms": 180,
@@ -240,9 +240,15 @@ it. Four loss points, all observable in `/stats`:
 2. **Agent queue full** (`drops.queue_full`) — internal `rawCh` is
    bounded by `MESH0_QUEUE_SIZE`. The listener never blocks; if the
    batcher is behind, the newest datagram is dropped.
-3. **Flush failures** (`drops.flush_failed`) — gateway 4xx (non-429),
+3. **Per-event validation** (`drops.parse_error`, `drops.oversize`,
+   `drops.unknown_field`) — non-object datagrams, datagrams over
+   `MESH0_MAX_EVENT_BYTES`, and datagrams whose top-level keys aren't
+   in the mesh0 ingest contract. The unknown-field check mirrors the
+   API's `DisallowUnknownFields` and isolates the failure to the
+   offending event instead of 400-ing the whole batch.
+4. **Flush failures** (`drops.flush_failed`) — gateway 4xx (non-429),
    or 429/5xx after `MESH0_MAX_RETRIES`.
-4. **Shutdown grace exhausted** (`drops.shutdown`) — events still in
+5. **Shutdown grace exhausted** (`drops.shutdown`) — events still in
    flight (or queued behind a wedged POST) when
    `MESH0_SHUTDOWN_GRACE_MS` elapses are abandoned and counted.
 
