@@ -29,8 +29,8 @@ const readBufBytes = 8 << 20 // 8MB
 //
 // readBufSize bounds each ReadFrom call. To keep oversize accounting visible,
 // callers should pass `maxEventBytes + 1` so a too-large datagram is read at
-// MaxEventBytes+1 (and then dropped at the validator) rather than silently
-// truncated at MaxEventBytes by the kernel.
+// boundary+1 (and then dropped by the validator) rather than silently
+// truncated at maxEventBytes by the kernel.
 func listen(ctx context.Context, path string, readBufSize int, out chan<- rawDatagram, log *slog.Logger, stats *selfStats) error {
 	if path == "" {
 		return errors.New("MESH0_LISTEN_PATH is empty")
