@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## Unreleased
+
+- Per-datagram size cap is now configurable via `MESH0_MAX_EVENT_BYTES`,
+  with a new default of **1 MB** (was a hard-coded 32 KB). Range
+  `[1 KB, 16 MB]`. Worst-case in-flight memory is `MESH0_QUEUE_SIZE ×
+  MESH0_MAX_EVENT_BYTES`; if you raise the cap, consider lowering the
+  queue size to keep the memory budget bounded.
+- The listener's read-buffer pool is now sized to `max_event_bytes + 1`,
+  so an oversized datagram is read at the boundary and rejected by the
+  validator with `drops.oversize` accounting rather than silently
+  truncated by the kernel.
+- **Operator note:** to send datagrams larger than your system default,
+  Linux requires `net.core.wmem_max` / `net.core.rmem_max` raised on
+  both ends, and the SDK/client must call `setsockopt(SO_SNDBUF, ...)`.
+  macOS additionally caps unixgram datagrams at `net.local.dgram.maxdgram`
+  (default 2 KB).
+
 ## 0.3.0
 
 - **BREAKING:** UDP listening removed. The agent now exclusively listens on

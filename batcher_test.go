@@ -17,11 +17,16 @@ import (
 
 func newTestBatcher(t *testing.T, maxBatch int, window time.Duration) (chan rawDatagram, chan EventBatch, *eventsBatcher, *selfStats, chan struct{}) {
 	t.Helper()
+	return newTestBatcherWithCap(t, maxBatch, DefaultMaxEventBytes, window)
+}
+
+func newTestBatcherWithCap(t *testing.T, maxBatch, maxEventBytes int, window time.Duration) (chan rawDatagram, chan EventBatch, *eventsBatcher, *selfStats, chan struct{}) {
+	t.Helper()
 	in := make(chan rawDatagram, 1024)
 	out := make(chan EventBatch, 16)
 	stats := newSelfStats()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	b := newEventsBatcher(in, out, stats, log, maxBatch, window)
+	b := newEventsBatcher(in, out, stats, log, maxBatch, maxEventBytes, window)
 	done := make(chan struct{})
 	go func() {
 		b.run()
@@ -83,12 +88,13 @@ func TestBatcherFlushesAtWindow(t *testing.T) {
 }
 
 func TestBatcherDropsOversize(t *testing.T) {
-	in, _, _, stats, done := newTestBatcher(t, 500, 50*time.Millisecond)
+	const maxBytes = 4096
+	in, _, _, stats, done := newTestBatcherWithCap(t, 500, maxBytes, 50*time.Millisecond)
 	defer func() {
 		close(in)
 		<-done
 	}()
-	big := strings.Repeat("a", 33*1024)
+	big := strings.Repeat("a", maxBytes+1)
 	by, _ := json.Marshal(map[string]any{"x": big})
 	in <- rawDatagram{bytes: by, at: time.Now()}
 	// Give the batcher a chance to process.
@@ -116,8 +122,9 @@ func TestBatcherDropsParseError(t *testing.T) {
 // regression that uses post-append size or inverts the comparison would
 // produce oversized POSTs that the gateway 413s.
 func TestBatcherFlushesAtByteCap(t *testing.T) {
-	// Build events whose validated form is just under MaxEventBytes (32KB)
-	// each. ~340 of them sum to >10MB (MaxBatchBytes).
+	// Build events whose validated form is well under the configured
+	// per-event cap (1 MB default). ~340 30 KB events sum to >10 MB
+	// (MaxBatchBytes).
 	in, out, _, _, done := newTestBatcher(t, 5000, 5*time.Second)
 	defer func() {
 		close(in)
@@ -179,7 +186,7 @@ func TestBatcherFinalFlushAbortsOnCtxCancel(t *testing.T) {
 	out := make(chan EventBatch)
 	stats := newSelfStats()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	b := newEventsBatcher(in, out, stats, log, 500, 5*time.Second)
+	b := newEventsBatcher(in, out, stats, log, 500, DefaultMaxEventBytes, 5*time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
 	b.ctx = ctx
 	done := make(chan struct{})
@@ -227,7 +234,7 @@ func TestListenerDropsOnFullQueue(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_ = listen(ctx, sockPath, rawCh, log, stats)
+		_ = listen(ctx, sockPath, DefaultMaxEventBytes+1, rawCh, log, stats)
 	}()
 	if err := waitForSocket(sockPath, 500*time.Millisecond); err != nil {
 		t.Fatalf("socket not ready: %v", err)
@@ -284,7 +291,7 @@ func TestListenerDispatchesJSON(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_ = listen(ctx, sockPath, rawCh, log, stats)
+		_ = listen(ctx, sockPath, DefaultMaxEventBytes+1, rawCh, log, stats)
 	}()
 	if err := waitForSocket(sockPath, 500*time.Millisecond); err != nil {
 		t.Fatalf("socket not ready: %v", err)

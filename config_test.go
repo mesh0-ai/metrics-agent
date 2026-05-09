@@ -112,6 +112,39 @@ func TestLoadConfigValidationRanges(t *testing.T) {
 			want: "MESH0_MAX_BATCH",
 		},
 		{
+			name: "max_event_bytes default",
+			env:  map[string]string{},
+			assert: func(t *testing.T, c Config) {
+				if c.MaxEventBytes != DefaultMaxEventBytes {
+					t.Errorf("MaxEventBytes: got %d want %d", c.MaxEventBytes, DefaultMaxEventBytes)
+				}
+			},
+		},
+		{
+			name: "max_event_bytes valid",
+			env:  map[string]string{"MESH0_MAX_EVENT_BYTES": "65536"},
+			assert: func(t *testing.T, c Config) {
+				if c.MaxEventBytes != 65536 {
+					t.Errorf("MaxEventBytes: got %d", c.MaxEventBytes)
+				}
+			},
+		},
+		{
+			name: "max_event_bytes below floor rejected",
+			env:  map[string]string{"MESH0_MAX_EVENT_BYTES": "512"},
+			want: "MESH0_MAX_EVENT_BYTES",
+		},
+		{
+			name: "max_event_bytes above ceiling rejected",
+			env:  map[string]string{"MESH0_MAX_EVENT_BYTES": "33554432"},
+			want: "MESH0_MAX_EVENT_BYTES",
+		},
+		{
+			name: "max_event_bytes non-numeric rejected",
+			env:  map[string]string{"MESH0_MAX_EVENT_BYTES": "1MB"},
+			want: "MESH0_MAX_EVENT_BYTES",
+		},
+		{
 			name: "queue_size valid",
 			env:  map[string]string{"MESH0_QUEUE_SIZE": "1"},
 			assert: func(t *testing.T, c Config) {
@@ -219,6 +252,7 @@ func clearMesh0Env(t *testing.T) {
 		"MESH0_HEALTH_ADDR",
 		"MESH0_BATCH_WINDOW_MS",
 		"MESH0_MAX_BATCH",
+		"MESH0_MAX_EVENT_BYTES",
 		"MESH0_QUEUE_SIZE",
 		"MESH0_MAX_RETRIES",
 		"MESH0_SHUTDOWN_GRACE_MS",

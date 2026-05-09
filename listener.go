@@ -17,12 +17,6 @@ import (
 // socket boundary; the agent's own goroutine drains it in a tight loop.
 const readBufBytes = 8 << 20 // 8MB
 
-// readerPool holds 64K scratch buffers reused across ReadFrom calls. The
-// listener never hands the pooled buffer itself downstream — bytes are copied
-// into a fresh slice before dispatch so the pooled buffer can be reused
-// immediately.
-var readerPool = sync.Pool{New: func() any { b := make([]byte, 64*1024); return &b }}
-
 // listen reads datagrams off a Unix-domain SOCK_DGRAM socket bound at
 // `path` and forwards each as a rawDatagram to `out`. Every datagram is
 // treated as one candidate JSON event; structural validation happens
@@ -32,9 +26,20 @@ var readerPool = sync.Pool{New: func() any { b := make([]byte, 64*1024); return 
 // and increments drops.queue_full so a slow flusher cannot stall the read
 // loop. On context cancel it closes the socket (which unblocks ReadFrom)
 // and unlinks the socket file before returning.
-func listen(ctx context.Context, path string, out chan<- rawDatagram, log *slog.Logger, stats *selfStats) error {
+//
+// readBufSize bounds each ReadFrom call. To keep oversize accounting visible,
+// callers should pass `maxEventBytes + 1` so a too-large datagram is read at
+// boundary+1 (and then dropped by the validator) rather than silently
+// truncated at maxEventBytes by the kernel.
+func listen(ctx context.Context, path string, readBufSize int, out chan<- rawDatagram, log *slog.Logger, stats *selfStats) error {
 	if path == "" {
 		return errors.New("MESH0_LISTEN_PATH is empty")
+	}
+	if readBufSize <= 0 {
+		// +1 vs. the validator cap so an exactly-cap-sized datagram still
+		// fits and an oversize one is read at boundary+1 and accounted via
+		// drops.oversize rather than silently truncated by the kernel.
+		readBufSize = DefaultMaxEventBytes + 1
 	}
 
 	conn, cleanup, err := bindUnixgram(path, log, stats)
@@ -43,7 +48,13 @@ func listen(ctx context.Context, path string, out chan<- rawDatagram, log *slog.
 	}
 	defer cleanup()
 
-	log.Info("listener started", "path", conn.LocalAddr().String())
+	// Pool sized to the configured read buffer; one listener exists per
+	// process, so this effectively holds a single buffer reused across reads.
+	// The pooled buffer is never handed downstream — bytes are copied into a
+	// fresh slice before dispatch so the buffer can be reused immediately.
+	pool := sync.Pool{New: func() any { b := make([]byte, readBufSize); return &b }}
+
+	log.Info("listener started", "path", conn.LocalAddr().String(), "read_buf_bytes", readBufSize)
 
 	closerDone := make(chan struct{})
 	go func() {
@@ -57,11 +68,11 @@ func listen(ctx context.Context, path string, out chan<- rawDatagram, log *slog.
 	var readErrBackoff time.Duration
 
 	for {
-		bp := readerPool.Get().(*[]byte)
+		bp := pool.Get().(*[]byte)
 		buf := *bp
 		n, _, err := conn.ReadFrom(buf)
 		if err != nil {
-			readerPool.Put(bp)
+			pool.Put(bp)
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -87,7 +98,7 @@ func listen(ctx context.Context, path string, out chan<- rawDatagram, log *slog.
 
 		datagram := make([]byte, n)
 		copy(datagram, buf[:n])
-		readerPool.Put(bp)
+		pool.Put(bp)
 
 		select {
 		case out <- rawDatagram{bytes: datagram, at: time.Now()}:

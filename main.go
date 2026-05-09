@@ -25,6 +25,7 @@ type Config struct {
 	HealthAddr    string
 	BatchWindow   time.Duration
 	MaxBatch      int
+	MaxEventBytes int
 	QueueSize     int
 	MaxRetries    int
 	ShutdownGrace time.Duration
@@ -40,6 +41,7 @@ func loadConfig() (Config, error) {
 		HealthAddr:    envOr("MESH0_HEALTH_ADDR", ":8126"),
 		BatchWindow:   200 * time.Millisecond,
 		MaxBatch:      500,
+		MaxEventBytes: DefaultMaxEventBytes,
 		QueueSize:     10_000,
 		MaxRetries:    4,
 		ShutdownGrace: 15 * time.Second,
@@ -58,6 +60,13 @@ func loadConfig() (Config, error) {
 			return c, fmt.Errorf("MESH0_MAX_BATCH must be an integer in [1, %d]", MaxEventsPerBatch)
 		}
 		c.MaxBatch = n
+	}
+	if v := os.Getenv("MESH0_MAX_EVENT_BYTES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < MinMaxEventBytes || n > MaxMaxEventBytes {
+			return c, fmt.Errorf("MESH0_MAX_EVENT_BYTES must be an integer in [%d, %d]", MinMaxEventBytes, MaxMaxEventBytes)
+		}
+		c.MaxEventBytes = n
 	}
 	if v := os.Getenv("MESH0_QUEUE_SIZE"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -129,6 +138,7 @@ func main() {
 		"endpoint", cfg.GatewayURL+cfg.EventsPath,
 		"batch_window", cfg.BatchWindow,
 		"max_batch", cfg.MaxBatch,
+		"max_event_bytes", cfg.MaxEventBytes,
 		"queue_size", cfg.QueueSize,
 	)
 
@@ -139,7 +149,7 @@ func main() {
 	rawCh := make(chan rawDatagram, cfg.QueueSize)
 	batchCh := make(chan EventBatch, 8)
 
-	batcher := newEventsBatcher(rawCh, batchCh, stats, log, cfg.MaxBatch, cfg.BatchWindow)
+	batcher := newEventsBatcher(rawCh, batchCh, stats, log, cfg.MaxBatch, cfg.MaxEventBytes, cfg.BatchWindow)
 	flush := newEventsFlusher(batchCh, cfg, log, stats)
 
 	flushCtx, flushCancel := context.WithCancel(context.Background())
@@ -152,7 +162,7 @@ func main() {
 	//   ctx -> listener returns -> close(rawCh) -> batcher emits final
 	//   batch and returns -> close(batchCh) -> flusher drains.
 	listenerErr := make(chan error, 1)
-	go func() { listenerErr <- listen(ctx, cfg.ListenPath, rawCh, log, stats) }()
+	go func() { listenerErr <- listen(ctx, cfg.ListenPath, cfg.MaxEventBytes+1, rawCh, log, stats) }()
 
 	batcherDone := make(chan struct{})
 	go func() {
