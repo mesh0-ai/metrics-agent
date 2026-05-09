@@ -28,8 +28,8 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.EventsPath != "/v1/events" {
 		t.Errorf("EventsPath default: got %q", cfg.EventsPath)
 	}
-	if cfg.ListenAddr != ":8125" {
-		t.Errorf("ListenAddr default: got %q", cfg.ListenAddr)
+	if cfg.ListenPath != "/run/mesh0/agent.sock" {
+		t.Errorf("ListenPath default: got %q", cfg.ListenPath)
 	}
 	if cfg.HealthAddr != ":8126" {
 		t.Errorf("HealthAddr default: got %q", cfg.HealthAddr)
@@ -215,7 +215,7 @@ func clearMesh0Env(t *testing.T) {
 		"MESH0_API_KEY",
 		"MESH0_BASE_URL",
 		"MESH0_EVENTS_PATH",
-		"MESH0_LISTEN_ADDR",
+		"MESH0_LISTEN_PATH",
 		"MESH0_HEALTH_ADDR",
 		"MESH0_BATCH_WINDOW_MS",
 		"MESH0_MAX_BATCH",

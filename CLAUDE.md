@@ -2,11 +2,12 @@
 
 ## Intent
 
-This binary exists to do one thing well: accept opaque JSON events over local
-UDP and forward them, batched, to the mesh0 ingest API over authenticated
-HTTPS. It is a long-running sidecar that absorbs the per-request HTTPS cost
-that short-lived processes (PHP, CGI, serverless workers) cannot amortize on
-their own.
+This binary exists to do one thing well: accept opaque JSON events over a
+local Unix-domain SOCK_DGRAM socket and forward them, batched, to the mesh0
+ingest API over authenticated HTTPS. It is a long-running sidecar that
+absorbs the per-request HTTPS cost that short-lived processes (PHP, CGI,
+serverless workers) cannot amortize on their own. The wire is UDS-DGRAM
+only — no UDP, no TCP, no cross-host transport.
 
 The agent is deliberately a **pass-through batcher**, not a metrics
 aggregator. It does not parse statsd, compute quantiles, dedupe series, or
@@ -17,9 +18,10 @@ the agent validates structure (must be a JSON object, ≤ 32 KB), stamps a
 
 ## Design priorities, in order
 
-1. **Never block the caller.** UDP is at-most-once and fire-and-forget. The
-   listener uses a non-blocking send onto a bounded queue; saturation drops
-   the newest datagram and increments `drops.queue_full` rather than stalling
+1. **Never block the caller.** UDS-DGRAM is fire-and-forget; on a saturated
+   recv buffer the kernel drops, never blocks. The listener uses a
+   non-blocking send onto a bounded queue; queue saturation drops the
+   newest datagram and increments `drops.queue_full` rather than stalling
    the read loop.
 2. **Never lose silently.** Every drop has a counter visible at `/stats`:
    `parse_error`, `oversize`, `queue_full`, `flush_failed`. Operators must be
@@ -31,9 +33,10 @@ the agent validates structure (must be a JSON object, ≤ 32 KB), stamps a
 4. **Fail the right batches.** Retry only on transient gateway responses
    (network errors, 408, 429, 5xx) with exponential backoff + jitter; drop
    client-error 4xx immediately so a bad batch cannot wedge the pipeline.
-5. **Drain on shutdown.** SIGTERM closes the UDP socket, the batcher emits
-   its final partial batch, and the flusher gets `MESH0_SHUTDOWN_GRACE_MS`
-   to finish in-flight POSTs before being cancelled.
+5. **Drain on shutdown.** SIGTERM closes the UDS socket (and unlinks the
+   socket file), the batcher emits its final partial batch, and the
+   flusher gets `MESH0_SHUTDOWN_GRACE_MS` to finish in-flight POSTs
+   before being cancelled.
 
 ## Architecture
 
@@ -49,7 +52,9 @@ in `selfStats` atomics ([stats.go](stats.go)) or the channels themselves.
 ## Non-goals
 
 - In-process aggregation, sampling, or rollup.
-- Local persistence / disk spool. UDP loss tolerance is the contract.
+- Local persistence / disk spool. Datagram loss tolerance is the contract.
+- Cross-host transport. The agent and the app must be on the same host —
+  if you need a network hop, put a real ingest gateway in front.
 - Any wire format other than JSON-object-per-datagram.
 - TLS termination, mTLS, or auth proxying — the agent is a client of mesh0,
   not a server-facing gateway.

@@ -22,7 +22,7 @@ const MaxEventsPerBatch = 5000
 // pre-flush if appending the next event would push us past this.
 const MaxBatchBytes = 10 * 1024 * 1024
 
-// rawDatagram is one UDP payload destined for the JSON event path. The bytes
+// rawDatagram is one UDS-DGRAM payload destined for the JSON event path. The bytes
 // are owned by this struct (already copied off the listener's pooled read
 // buffer) — receivers can keep them.
 type rawDatagram struct {

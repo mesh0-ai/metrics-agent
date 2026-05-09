@@ -29,52 +29,14 @@ func shortTempSocketPath(t *testing.T) string {
 	return p
 }
 
-func TestParseListenAddr(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		in       string
-		wantSch  string
-		wantUDP  string
-		wantUnix string
-		wantErr  bool
-	}{
-		{":8125", "udp", ":8125", "", false},
-		{"127.0.0.1:8125", "udp", "127.0.0.1:8125", "", false},
-		{"udp://0.0.0.0:8125", "udp", "0.0.0.0:8125", "", false},
-		{"unix:///run/mesh0/agent.sock", "unix", "", "/run/mesh0/agent.sock", false},
-		{"unixgram:///tmp/a.sock", "unix", "", "/tmp/a.sock", false},
-		{"unix://", "", "", "", true},
-		{"unixgram://", "", "", "", true},
-		{"", "", "", "", true},
-	}
-	for _, tc := range cases {
-		got, err := parseListenAddr(tc.in)
-		if tc.wantErr {
-			if err == nil {
-				t.Errorf("parseListenAddr(%q): expected error, got %+v", tc.in, got)
-			}
-			continue
-		}
-		if err != nil {
-			t.Errorf("parseListenAddr(%q): unexpected error %v", tc.in, err)
-			continue
-		}
-		if got.scheme != tc.wantSch || got.UDPAddr != tc.wantUDP || got.UnixPath != tc.wantUnix {
-			t.Errorf("parseListenAddr(%q): got %+v, want scheme=%q udp=%q unix=%q",
-				tc.in, got, tc.wantSch, tc.wantUDP, tc.wantUnix)
-		}
-	}
-}
-
-// TestListenUDSDgramRoundTrip ensures a datagram fired at a unix:// listen
-// addr lands on the rawCh end of the listener with bytes intact, and that
-// the socket file is unlinked when the listener returns.
-func TestListenUDSDgramRoundTrip(t *testing.T) {
+// TestListenRoundTrip ensures a datagram fired at the listen path lands on
+// the rawCh end of the listener with bytes intact, and that the socket
+// file is unlinked when the listener returns.
+func TestListenRoundTrip(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("UDS-DGRAM not supported on Windows")
 	}
 	sockPath := shortTempSocketPath(t)
-	addr := "unix://" + sockPath
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -84,17 +46,12 @@ func TestListenUDSDgramRoundTrip(t *testing.T) {
 	log := slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	listenErr := make(chan error, 1)
-	go func() { listenErr <- listen(ctx, addr, out, log, stats) }()
+	go func() { listenErr <- listen(ctx, sockPath, out, log, stats) }()
 
-	// Wait for the bind to settle. ListenUnixgram is synchronous in
-	// net.ListenUnixgram, but the socket may take a microbeat to be
-	// stat-able from the test process.
 	if err := waitForSocket(sockPath, 500*time.Millisecond); err != nil {
 		t.Fatalf("socket not ready: %v", err)
 	}
 
-	// Fire one datagram via a Go-side unix client (mirrors what PHP
-	// `udg://` would do).
 	cliAddr, err := net.ResolveUnixAddr("unixgram", sockPath)
 	if err != nil {
 		t.Fatalf("resolve client addr: %v", err)
@@ -118,7 +75,6 @@ func TestListenUDSDgramRoundTrip(t *testing.T) {
 		t.Fatal("no datagram received within 1s")
 	}
 
-	// Shut down and verify the socket file is unlinked.
 	cancel()
 	select {
 	case err := <-listenErr:
@@ -133,17 +89,15 @@ func TestListenUDSDgramRoundTrip(t *testing.T) {
 	}
 }
 
-// TestListenUDSDgramRemovesStaleSocket ensures the listener removes a
-// leftover socket file from a previous unclean shutdown rather than
-// failing with EADDRINUSE.
-func TestListenUDSDgramRemovesStaleSocket(t *testing.T) {
+// TestListenRemovesStaleSocket ensures the listener removes a leftover
+// socket file from a previous unclean shutdown rather than failing with
+// EADDRINUSE.
+func TestListenRemovesStaleSocket(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("UDS-DGRAM not supported on Windows")
 	}
 	sockPath := shortTempSocketPath(t)
 
-	// Plant a stale socket file by binding-and-leaking, then closing
-	// without unlinking (simulating an ungraceful crash).
 	stale, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: sockPath, Net: "unixgram"})
 	if err != nil {
 		t.Fatalf("plant stale socket: %v", err)
@@ -160,7 +114,7 @@ func TestListenUDSDgramRemovesStaleSocket(t *testing.T) {
 	log := slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	listenErr := make(chan error, 1)
-	go func() { listenErr <- listen(ctx, "unix://"+sockPath, out, log, stats) }()
+	go func() { listenErr <- listen(ctx, sockPath, out, log, stats) }()
 
 	if err := waitForSocket(sockPath, 500*time.Millisecond); err != nil {
 		t.Fatalf("socket not ready: %v", err)
@@ -169,9 +123,9 @@ func TestListenUDSDgramRemovesStaleSocket(t *testing.T) {
 	<-listenErr
 }
 
-// TestListenUDSDgramRejectsNonSocketFile ensures we don't unlink an
-// arbitrary file the operator left in place.
-func TestListenUDSDgramRejectsNonSocketFile(t *testing.T) {
+// TestListenRejectsNonSocketFile ensures we don't unlink an arbitrary file
+// the operator left in place.
+func TestListenRejectsNonSocketFile(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("UDS-DGRAM not supported on Windows")
 	}
@@ -185,13 +139,22 @@ func TestListenUDSDgramRejectsNonSocketFile(t *testing.T) {
 	stats := newSelfStats()
 	log := slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 
-	err := listen(ctx, "unix://"+path, out, log, stats)
+	err := listen(ctx, path, out, log, stats)
 	if err == nil {
 		t.Fatal("expected error binding over a non-socket file")
 	}
-	// The plain file must survive — never silently deleted.
 	if _, err := os.Stat(path); err != nil {
 		t.Errorf("regular file at bind path was disturbed: %v", err)
+	}
+}
+
+// TestListenRejectsEmptyPath guards against a misconfigured launch where
+// MESH0_LISTEN_PATH is unset or blank.
+func TestListenRejectsEmptyPath(t *testing.T) {
+	stats := newSelfStats()
+	log := slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	if err := listen(context.Background(), "", make(chan rawDatagram, 1), log, stats); err == nil {
+		t.Fatal("expected error from empty path")
 	}
 }
 

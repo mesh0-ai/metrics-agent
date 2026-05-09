@@ -4,17 +4,22 @@ All notable changes to this project are documented here.
 
 ## 0.3.0
 
-- Listener now also accepts **Unix domain sockets in datagram mode**
-  (`SOCK_DGRAM`). Set `MESH0_LISTEN_ADDR=unix:///run/mesh0/agent.sock`
-  (or `unixgram:///path`) to bind a UDS instead of UDP. Default remains
-  the UDP form (`:8125`); existing deployments are unaffected.
-- For UDS listeners the agent removes any stale socket file on startup
-  (idempotent restart), `chmod 0666` the bound socket so app processes
-  running as a different uid can write to it without uid alignment, and
-  unlinks the socket on graceful shutdown. A non-socket file at the bind
-  path is rejected rather than removed.
-- `parseListenAddr` validates the address at startup, so a malformed
-  `MESH0_LISTEN_ADDR` fails before any goroutine is spun up.
+- **BREAKING:** UDP listening removed. The agent now exclusively listens on
+  a Unix-domain SOCK_DGRAM socket. Existing deployments must mount a
+  shared socket volume between the app and agent containers and switch
+  their SDK/client from UDP to `udg://` (PHP) / `socket(AF_UNIX,
+  SOCK_DGRAM)` (other languages).
+- **BREAKING:** `MESH0_LISTEN_ADDR` is replaced by `MESH0_LISTEN_PATH`.
+  Default is `/run/mesh0/agent.sock`. The value is a filesystem path —
+  no `unix://` / `udp://` URL prefixes accepted.
+- **BREAKING:** `/stats` field renames: `udp_read_errors` → `read_errors`,
+  `udp_buffer_degraded` → `buffer_degraded`. Update any dashboards or
+  alerting that scrape these fields.
+- The agent removes any stale socket file on startup (idempotent
+  restart), `chmod 0666` the bound socket so app processes running as a
+  different uid can write to it without uid alignment, and unlinks the
+  socket on graceful shutdown. A non-socket file at the bind path is
+  rejected rather than removed.
 
 ## 0.2.0
 

@@ -18,8 +18,8 @@ type selfStats struct {
 	DropsOversize     atomic.Uint64
 	DropsFlushFailed  atomic.Uint64
 	DropsShutdown     atomic.Uint64
-	UDPReadErrors     atomic.Uint64
-	UDPBufferDegraded atomic.Bool  // kernel rejected the requested SO_RCVBUF
+	ReadErrors     atomic.Uint64
+	BufferDegraded atomic.Bool  // kernel rejected the requested SO_RCVBUF
 	LastEventFlushMs  atomic.Int64 // unix-millis of last successful event flush
 
 	startUnix int64
@@ -36,8 +36,8 @@ type statsSnapshot struct {
 	BatchesSent       uint64    `json:"batches_sent"`
 	EventsSent        uint64    `json:"events_sent"`
 	LastFlushAgeMs    int64     `json:"last_flush_age_ms"`
-	UDPReadErrors     uint64    `json:"udp_read_errors"`
-	UDPBufferDegraded bool      `json:"udp_buffer_degraded"`
+	ReadErrors     uint64    `json:"read_errors"`
+	BufferDegraded bool      `json:"buffer_degraded"`
 	UptimeS           int64     `json:"uptime_s"`
 }
 
@@ -68,8 +68,8 @@ func (s *selfStats) snapshot() statsSnapshot {
 		BatchesSent:       s.BatchesSent.Load(),
 		EventsSent:        s.EventsSent.Load(),
 		LastFlushAgeMs:    ageMs,
-		UDPReadErrors:     s.UDPReadErrors.Load(),
-		UDPBufferDegraded: s.UDPBufferDegraded.Load(),
+		ReadErrors:     s.ReadErrors.Load(),
+		BufferDegraded: s.BufferDegraded.Load(),
 		UptimeS:           now.Unix() - s.startUnix,
 	}
 }
