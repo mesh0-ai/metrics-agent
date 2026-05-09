@@ -10,17 +10,18 @@ import (
 // scraping logs. All fields are accessed via atomics so any goroutine can
 // update them on its hot path without locks.
 type selfStats struct {
-	EventsReceived    atomic.Uint64
-	EventsSent        atomic.Uint64
-	BatchesSent       atomic.Uint64
-	DropsParseError   atomic.Uint64
-	DropsQueueFull    atomic.Uint64
-	DropsOversize     atomic.Uint64
-	DropsFlushFailed  atomic.Uint64
-	DropsShutdown     atomic.Uint64
-	ReadErrors     atomic.Uint64
-	BufferDegraded atomic.Bool  // kernel rejected the requested SO_RCVBUF
-	LastEventFlushMs  atomic.Int64 // unix-millis of last successful event flush
+	EventsReceived   atomic.Uint64
+	EventsSent       atomic.Uint64
+	BatchesSent      atomic.Uint64
+	DropsParseError  atomic.Uint64
+	DropsQueueFull   atomic.Uint64
+	DropsOversize    atomic.Uint64
+	DropsFlushFailed atomic.Uint64
+	DropsShutdown    atomic.Uint64
+	ReadErrors       atomic.Uint64
+	BufferDegraded   atomic.Bool  // kernel rejected the requested SO_RCVBUF
+	ListenerFatal    atomic.Bool  // listener goroutine exited unexpectedly
+	LastEventFlushMs atomic.Int64 // unix-millis of last successful event flush
 
 	startUnix int64
 }
@@ -31,14 +32,15 @@ func newSelfStats() *selfStats {
 
 // statsSnapshot is the JSON shape of GET /stats.
 type statsSnapshot struct {
-	EventsReceived    uint64    `json:"events_received"`
-	EventsDropped     dropStats `json:"events_dropped"`
-	BatchesSent       uint64    `json:"batches_sent"`
-	EventsSent        uint64    `json:"events_sent"`
-	LastFlushAgeMs    int64     `json:"last_flush_age_ms"`
+	EventsReceived uint64    `json:"events_received"`
+	EventsDropped  dropStats `json:"events_dropped"`
+	BatchesSent    uint64    `json:"batches_sent"`
+	EventsSent     uint64    `json:"events_sent"`
+	LastFlushAgeMs int64     `json:"last_flush_age_ms"`
 	ReadErrors     uint64    `json:"read_errors"`
 	BufferDegraded bool      `json:"buffer_degraded"`
-	UptimeS           int64     `json:"uptime_s"`
+	ListenerFatal  bool      `json:"listener_fatal"`
+	UptimeS        int64     `json:"uptime_s"`
 }
 
 type dropStats struct {
@@ -65,11 +67,12 @@ func (s *selfStats) snapshot() statsSnapshot {
 			FlushFailed: s.DropsFlushFailed.Load(),
 			Shutdown:    s.DropsShutdown.Load(),
 		},
-		BatchesSent:       s.BatchesSent.Load(),
-		EventsSent:        s.EventsSent.Load(),
-		LastFlushAgeMs:    ageMs,
+		BatchesSent:    s.BatchesSent.Load(),
+		EventsSent:     s.EventsSent.Load(),
+		LastFlushAgeMs: ageMs,
 		ReadErrors:     s.ReadErrors.Load(),
 		BufferDegraded: s.BufferDegraded.Load(),
-		UptimeS:           now.Unix() - s.startUnix,
+		ListenerFatal:  s.ListenerFatal.Load(),
+		UptimeS:        now.Unix() - s.startUnix,
 	}
 }

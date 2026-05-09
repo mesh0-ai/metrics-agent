@@ -96,11 +96,14 @@ func (f *eventsFlusher) run() {
 	}
 }
 
-// send POSTs one batch with retry/backoff. Drops the batch (and counts it as
-// flush_failed) once retries are exhausted or the context is cancelled.
+// send POSTs one batch with retry/backoff. Drops the batch once retries are
+// exhausted (drops.flush_failed) or the shutdown context is cancelled mid-flight
+// (drops.shutdown). Splitting the two lets operators distinguish a wedged
+// gateway from a hard shutdown.
 func (f *eventsFlusher) send(batch EventBatch) {
 	body := encodeEventBatch(batch)
 	var lastErr error
+	cancelled := false
 
 	// Total attempts = 1 + maxRetries. Backoff base 250ms, doubling, capped
 	// at 5s; jitter scales by [0.5, 1.5) to spread retries across instances.
@@ -119,6 +122,7 @@ func (f *eventsFlusher) send(batch EventBatch) {
 			case <-time.After(d):
 			case <-f.ctx.Done():
 				lastErr = f.ctx.Err()
+				cancelled = true
 				goto fail
 			}
 		}
@@ -136,6 +140,7 @@ func (f *eventsFlusher) send(batch EventBatch) {
 		}
 		lastErr = err
 		if errors.Is(err, context.Canceled) {
+			cancelled = true
 			break
 		}
 		if !isRetryable(err) {
@@ -143,6 +148,14 @@ func (f *eventsFlusher) send(batch EventBatch) {
 		}
 	}
 fail:
+	if cancelled {
+		f.stats.DropsShutdown.Add(uint64(len(batch.Events)))
+		f.log.Warn("events flush cancelled by shutdown, dropping batch",
+			"events", len(batch.Events),
+			"err", lastErr,
+		)
+		return
+	}
 	f.stats.DropsFlushFailed.Add(uint64(len(batch.Events)))
 	f.log.Warn("events flush failed, dropping batch",
 		"events", len(batch.Events),

@@ -211,7 +211,6 @@ func (b *eventsBatcher) run() {
 				b.stats.DropsParseError.Add(1)
 				continue
 			}
-			b.stats.EventsReceived.Add(1)
 			if len(b.cur) > 0 && b.curBytes+len(ev)+1 > MaxBatchBytes {
 				b.flush()
 				disarmTimer()

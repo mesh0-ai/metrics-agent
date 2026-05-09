@@ -100,6 +100,12 @@ func loadConfig() (Config, error) {
 	if c.ListenPath == "" {
 		return c, errors.New("MESH0_LISTEN_PATH is required")
 	}
+	// sun_path is 104 bytes on macOS and 108 on Linux; use the smaller cap so
+	// the same config is portable. The kernel returns EINVAL otherwise, which
+	// surfaces as an opaque "bind: invalid argument".
+	if len(c.ListenPath) > 103 {
+		return c, fmt.Errorf("MESH0_LISTEN_PATH must be <= 103 bytes (got %d)", len(c.ListenPath))
+	}
 	return c, nil
 }
 
@@ -166,6 +172,7 @@ func main() {
 		<-listenerErr
 	case err := <-listenerErr:
 		if err != nil {
+			stats.ListenerFatal.Store(true)
 			log.Error("listener exited", "err", err)
 		}
 		cancel()

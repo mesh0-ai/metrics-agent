@@ -102,3 +102,27 @@ func TestHasTopLevelKeyIgnoresNested(t *testing.T) {
 		t.Error("missed top-level y")
 	}
 }
+
+// TestHasTopLevelKeyIgnoresStringContents guards against a regression to a
+// hand-rolled scanner: keys that appear inside string values (with or
+// without escaped quotes) must not be matched as top-level keys.
+func TestHasTopLevelKeyIgnoresStringContents(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		key  string
+		want bool
+	}{
+		{"plain string value", `{"a":"timestamp inside","b":1}`, "timestamp", false},
+		{"escaped quotes inside string", `{"a":"has \"timestamp\" inside","b":1}`, "timestamp", false},
+		{"value contains key as substring", `{"name":"timestamp_field"}`, "timestamp", false},
+		{"actual top-level after decoy", `{"a":"timestamp","timestamp":"2024-01-01T00:00:00Z"}`, "timestamp", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasTopLevelKey([]byte(tc.in), tc.key); got != tc.want {
+				t.Errorf("hasTopLevelKey(%q, %q) = %v, want %v", tc.in, tc.key, got, tc.want)
+			}
+		})
+	}
+}

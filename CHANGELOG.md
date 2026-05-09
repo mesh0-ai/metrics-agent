@@ -20,6 +20,26 @@ All notable changes to this project are documented here.
   different uid can write to it without uid alignment, and unlinks the
   socket on graceful shutdown. A non-socket file at the bind path is
   rejected rather than removed.
+- **BREAKING:** A `chmod 0666` failure on the bound socket now hard-fails
+  the listener instead of being logged-and-ignored. A silent perms
+  failure would have left the agent reporting zero traffic forever; an
+  early fatal exit is the right outcome.
+- `MESH0_LISTEN_PATH` is rejected at startup if the path exceeds 103
+  bytes (`sun_path` is 104 on macOS / 108 on Linux). This produces a
+  clear config error instead of an opaque kernel `EINVAL` at bind time.
+- New `/stats` field `listener_fatal` (bool) — set to `true` when the
+  listener goroutine exits with a non-nil error before SIGTERM. Alert
+  on this; the process will drain and exit, but `events_received` may
+  otherwise look healthy.
+- Flusher cancellations during shutdown are now accounted as
+  `events_dropped.shutdown` rather than `events_dropped.flush_failed`,
+  so operators can distinguish a wedged gateway from a hard shutdown.
+  `flush_failed` is now reserved for genuine gateway failures
+  (retry-exhausted 5xx/429, or non-retryable 4xx).
+- Internal: removed a double-increment of `events_received` (the listener
+  and the batcher both counted every datagram). The counter now reflects
+  every datagram the agent reads off the socket, exactly once, so
+  `events_received ≈ events_sent + sum(events_dropped.*)` holds.
 
 ## 0.2.0
 

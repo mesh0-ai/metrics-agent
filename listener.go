@@ -104,8 +104,11 @@ func bindUnixgram(path string, log *slog.Logger, stats *selfStats) (net.PacketCo
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		// Best-effort: parent dir is usually pre-created by the operator
 		// (mounted volume or tmpfs). If it isn't, fall through so the bind
-		// error surfaces with the right context.
-		_ = os.MkdirAll(dir, 0o755)
+		// error surfaces with the right context — but log at debug so the
+		// chain remains traceable when an operator is debugging perms.
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			log.Debug("mkdir parent dir failed", "dir", dir, "err", err)
+		}
 	}
 	// Stale socket files survive ungraceful shutdowns. ListenUnixgram
 	// would return EADDRINUSE; remove first so restarts are idempotent.
@@ -136,8 +139,12 @@ func bindUnixgram(path string, log *slog.Logger, stats *selfStats) (net.PacketCo
 	// commonly runs as a different uid (e.g. www-data). 0666 keeps the
 	// fire-and-forget contract working without forcing operators to match
 	// uids. If you need stricter perms, set them on the parent directory.
+	// A chmod failure means cross-uid clients cannot write — fail the bind
+	// rather than silently running a useless agent that reports no traffic.
 	if err := os.Chmod(path, 0o666); err != nil {
-		log.Warn("chmod unix socket failed", "path", path, "err", err)
+		_ = conn.Close()
+		_ = os.Remove(path)
+		return nil, nil, fmt.Errorf("chmod unix socket %q: %w", path, err)
 	}
 
 	cleanup := func() {

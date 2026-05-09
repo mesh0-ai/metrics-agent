@@ -40,7 +40,7 @@ func dgFromObj(t *testing.T, obj map[string]any) rawDatagram {
 }
 
 func TestBatcherFlushesAtMaxBatch(t *testing.T) {
-	in, out, _, stats, done := newTestBatcher(t, 500, 5*time.Second)
+	in, out, _, _, done := newTestBatcher(t, 500, 5*time.Second)
 	defer func() {
 		close(in)
 		<-done
@@ -60,9 +60,6 @@ func TestBatcherFlushesAtMaxBatch(t *testing.T) {
 	}
 	if len(first.Events) != 500 {
 		t.Errorf("first batch size: got %d want 500", len(first.Events))
-	}
-	if stats.EventsReceived.Load() < 500 {
-		t.Errorf("events_received: got %d want >=500", stats.EventsReceived.Load())
 	}
 }
 
@@ -271,9 +268,9 @@ func TestListenerDropsOnFullQueue(t *testing.T) {
 }
 
 // TestListenerDispatchesJSON is an integration test that fires real
-// datagrams at the listener and verifies SetReadBuffer is invoked (proven
-// by the listener starting successfully) and JSON datagrams reach the
-// batcher.
+// datagrams at the listener and verifies JSON datagrams reach the batcher
+// untouched. Non-JSON datagrams pass through the listener as raw bytes;
+// validation happens downstream in the batcher.
 func TestListenerDispatchesJSON(t *testing.T) {
 	stats := newSelfStats()
 	rawCh := make(chan rawDatagram, 16)

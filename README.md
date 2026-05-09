@@ -181,7 +181,7 @@ All knobs are environment variables.
 | `MESH0_API_KEY`           | (required)             | Per-project API key (`m0_…`).              |
 | `MESH0_BASE_URL`          | `https://api.mesh0.ai` | Override for self-hosted / staging.        |
 | `MESH0_EVENTS_PATH`       | `/v1/events`           | Path appended to base URL.                 |
-| `MESH0_LISTEN_PATH`       | `/run/mesh0/agent.sock`| UDS-DGRAM bind path. Parent dir is `MkdirAll`'d; stale socket files are unlinked on startup. |
+| `MESH0_LISTEN_PATH`       | `/run/mesh0/agent.sock`| UDS-DGRAM bind path (≤103 bytes — `sun_path` cap). Parent dir is `MkdirAll`'d; stale socket files are unlinked on startup; bind fails if `chmod 0666` is rejected. |
 | `MESH0_HEALTH_ADDR`       | `:8126`                | HTTP health/stats bind. Empty disables.    |
 | `MESH0_BATCH_WINDOW_MS`   | `200`                  | Max age of an event before its batch flushes. |
 | `MESH0_MAX_BATCH`         | `500`                  | Max events per batch (≤ 5000 server cap).  |
@@ -206,15 +206,22 @@ The agent exposes a small HTTP server on `MESH0_HEALTH_ADDR` (default `:8126`):
     "last_flush_age_ms": 180,
     "read_errors":       0,
     "buffer_degraded":   false,
+    "listener_fatal":    false,
     "uptime_s":          3600
   }
   ```
 
   - `events_dropped.shutdown` counts events abandoned when the shutdown
-    grace timer fires before the flusher finishes draining.
+    grace timer fires (or the flusher's in-flight POST is cancelled) before
+    the pipeline finishes draining. `flush_failed` is reserved for true
+    gateway failures (retry-exhausted 5xx/429, or non-retryable 4xx) so
+    operators can distinguish "gateway broken" from "we shut down."
   - `buffer_degraded` is `true` if the kernel rejected the agent's
     `SO_RCVBUF=8MB` request — investigate elevated socket-level loss
     via `/proc/net/unix` queue depth if so.
+  - `listener_fatal` is `true` if the listener goroutine returned a
+    non-nil error before SIGTERM. The process drains and exits, but
+    `events_received` may otherwise look healthy; alert on this flag.
 
 ## Loss model
 
