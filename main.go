@@ -21,7 +21,7 @@ type Config struct {
 	APIKey        string
 	GatewayURL    string
 	EventsPath    string
-	ListenAddr    string
+	ListenPath    string
 	HealthAddr    string
 	BatchWindow   time.Duration
 	MaxBatch      int
@@ -36,7 +36,7 @@ func loadConfig() (Config, error) {
 		APIKey:        os.Getenv("MESH0_API_KEY"),
 		GatewayURL:    envOr("MESH0_BASE_URL", "https://api.mesh0.ai"),
 		EventsPath:    envOr("MESH0_EVENTS_PATH", "/v1/events"),
-		ListenAddr:    envOr("MESH0_LISTEN_ADDR", ":8125"),
+		ListenPath:    envOr("MESH0_LISTEN_PATH", "/run/mesh0/agent.sock"),
 		HealthAddr:    envOr("MESH0_HEALTH_ADDR", ":8126"),
 		BatchWindow:   200 * time.Millisecond,
 		MaxBatch:      500,
@@ -97,6 +97,15 @@ func loadConfig() (Config, error) {
 	if c.APIKey == "" {
 		return c, errors.New("MESH0_API_KEY is required")
 	}
+	if c.ListenPath == "" {
+		return c, errors.New("MESH0_LISTEN_PATH is required")
+	}
+	// sun_path is 104 bytes on macOS and 108 on Linux; use the smaller cap so
+	// the same config is portable. The kernel returns EINVAL otherwise, which
+	// surfaces as an opaque "bind: invalid argument".
+	if len(c.ListenPath) > 103 {
+		return c, fmt.Errorf("MESH0_LISTEN_PATH must be <= 103 bytes (got %d)", len(c.ListenPath))
+	}
 	return c, nil
 }
 
@@ -116,7 +125,7 @@ func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	log.Info("starting mesh0 metrics agent",
 		"version", Version,
-		"listen", cfg.ListenAddr,
+		"listen", cfg.ListenPath,
 		"endpoint", cfg.GatewayURL+cfg.EventsPath,
 		"batch_window", cfg.BatchWindow,
 		"max_batch", cfg.MaxBatch,
@@ -143,7 +152,7 @@ func main() {
 	//   ctx -> listener returns -> close(rawCh) -> batcher emits final
 	//   batch and returns -> close(batchCh) -> flusher drains.
 	listenerErr := make(chan error, 1)
-	go func() { listenerErr <- listen(ctx, cfg.ListenAddr, rawCh, log, stats) }()
+	go func() { listenerErr <- listen(ctx, cfg.ListenPath, rawCh, log, stats) }()
 
 	batcherDone := make(chan struct{})
 	go func() {
@@ -163,6 +172,7 @@ func main() {
 		<-listenerErr
 	case err := <-listenerErr:
 		if err != nil {
+			stats.ListenerFatal.Store(true)
 			log.Error("listener exited", "err", err)
 		}
 		cancel()

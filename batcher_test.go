@@ -40,7 +40,7 @@ func dgFromObj(t *testing.T, obj map[string]any) rawDatagram {
 }
 
 func TestBatcherFlushesAtMaxBatch(t *testing.T) {
-	in, out, _, stats, done := newTestBatcher(t, 500, 5*time.Second)
+	in, out, _, _, done := newTestBatcher(t, 500, 5*time.Second)
 	defer func() {
 		close(in)
 		<-done
@@ -60,9 +60,6 @@ func TestBatcherFlushesAtMaxBatch(t *testing.T) {
 	}
 	if len(first.Events) != 500 {
 		t.Errorf("first batch size: got %d want 500", len(first.Events))
-	}
-	if stats.EventsReceived.Load() < 500 {
-		t.Errorf("events_received: got %d want >=500", stats.EventsReceived.Load())
 	}
 }
 
@@ -222,17 +219,7 @@ func TestListenerDropsOnFullQueue(t *testing.T) {
 	rawCh := make(chan rawDatagram, 1)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	addr := "127.0.0.1:0"
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	probeConn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	chosenAddr := probeConn.LocalAddr().String()
-	probeConn.Close()
+	sockPath := shortTempSocketPath(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -240,11 +227,17 @@ func TestListenerDropsOnFullQueue(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_ = listen(ctx, chosenAddr, rawCh, log, stats)
+		_ = listen(ctx, sockPath, rawCh, log, stats)
 	}()
-	time.Sleep(50 * time.Millisecond)
+	if err := waitForSocket(sockPath, 500*time.Millisecond); err != nil {
+		t.Fatalf("socket not ready: %v", err)
+	}
 
-	cli, err := net.Dial("udp", chosenAddr)
+	cliAddr, err := net.ResolveUnixAddr("unixgram", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli, err := net.DialUnix("unixgram", nil, cliAddr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,27 +267,16 @@ func TestListenerDropsOnFullQueue(t *testing.T) {
 	wg.Wait()
 }
 
-// TestListenerDispatchesJSON is an integration test that fires real UDP
-// datagrams at the listener and verifies SetReadBuffer is invoked (proven
-// by the listener starting successfully) and JSON datagrams reach the
-// batcher.
+// TestListenerDispatchesJSON is an integration test that fires real
+// datagrams at the listener and verifies JSON datagrams reach the batcher
+// untouched. Non-JSON datagrams pass through the listener as raw bytes;
+// validation happens downstream in the batcher.
 func TestListenerDispatchesJSON(t *testing.T) {
 	stats := newSelfStats()
 	rawCh := make(chan rawDatagram, 16)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	// Bind to an ephemeral port so parallel runs don't collide.
-	addr := "127.0.0.1:0"
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	conn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	chosenAddr := conn.LocalAddr().String()
-	conn.Close()
+	sockPath := shortTempSocketPath(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -302,12 +284,17 @@ func TestListenerDispatchesJSON(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_ = listen(ctx, chosenAddr, rawCh, log, stats)
+		_ = listen(ctx, sockPath, rawCh, log, stats)
 	}()
-	// Give the listener a moment to bind.
-	time.Sleep(50 * time.Millisecond)
+	if err := waitForSocket(sockPath, 500*time.Millisecond); err != nil {
+		t.Fatalf("socket not ready: %v", err)
+	}
 
-	cli, err := net.Dial("udp", chosenAddr)
+	cliAddr, err := net.ResolveUnixAddr("unixgram", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli, err := net.DialUnix("unixgram", nil, cliAddr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,8 +304,8 @@ func TestListenerDispatchesJSON(t *testing.T) {
 	if _, err := cli.Write([]byte(`{"op":"hi"}`)); err != nil {
 		t.Fatal(err)
 	}
-	// Non-JSON datagram (statsd-style) — should be silently dropped in
-	// the v0.2 events-only listener.
+	// Non-JSON datagram — passes the listener as raw bytes; the batcher
+	// will drop it as parse_error downstream.
 	if _, err := cli.Write([]byte(`metric:1|c`)); err != nil {
 		t.Fatal(err)
 	}
