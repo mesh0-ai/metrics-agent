@@ -31,7 +31,18 @@ const readBufBytes = 8 << 20 // 8MB
 // callers should pass `maxEventBytes + 1` so a too-large datagram is read at
 // boundary+1 (and then dropped by the validator) rather than silently
 // truncated at maxEventBytes by the kernel.
-func listen(ctx context.Context, path string, readBufSize int, out chan<- rawDatagram, log *slog.Logger, stats *selfStats) error {
+// listenSink is the interface the listener uses to dispatch a parsed
+// datagram. In production this is implemented by *registry (multi-tenant
+// routing). Tests inject a simpler sink that forwards to a single channel
+// to keep the existing listener tests focused on read-loop semantics.
+type listenSink interface {
+	// dispatch routes one datagram. Returns false if the datagram was
+	// dropped for a reason the listener should NOT account as queue_full
+	// (the sink has already bumped the appropriate counter).
+	dispatch(dg rawDatagram) (delivered bool, queueFull bool)
+}
+
+func listen(ctx context.Context, path string, readBufSize int, sink listenSink, log *slog.Logger, stats *selfStats) error {
 	if path == "" {
 		return errors.New("MESH0_LISTEN_PATH is empty")
 	}
@@ -100,9 +111,8 @@ func listen(ctx context.Context, path string, readBufSize int, out chan<- rawDat
 		copy(datagram, buf[:n])
 		pool.Put(bp)
 
-		select {
-		case out <- rawDatagram{bytes: datagram, at: time.Now()}:
-		default:
+		_, queueFull := sink.dispatch(rawDatagram{bytes: datagram, at: time.Now()})
+		if queueFull {
 			stats.DropsQueueFull.Add(1)
 		}
 	}

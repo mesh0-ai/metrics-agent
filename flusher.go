@@ -63,24 +63,29 @@ func postJSON(parent context.Context, client *http.Client, url, apiKey string, b
 // exponential backoff + jitter on 429/5xx/network up to MaxRetries, then
 // drops the batch and increments DropsFlushFailed.
 type eventsFlusher struct {
-	in         <-chan EventBatch
-	url        string
-	apiKey     string
-	httpClient *http.Client
-	log        *slog.Logger
-	stats      *selfStats
-	maxRetries int
-	ctx        context.Context
+	in            <-chan EventBatch
+	url           string
+	apiKey        string
+	httpClient    *http.Client
+	log           *slog.Logger
+	stats         *selfStats
+	pipelineStats *pipelineStats // optional; nil when not multi-tenant routed
+	maxRetries    int
+	ctx           context.Context
 
 	// rng is intentionally unsynchronised; only run() touches it.
 	rng *rand.Rand
 }
 
 func newEventsFlusher(in <-chan EventBatch, cfg Config, log *slog.Logger, stats *selfStats) *eventsFlusher {
+	return newEventsFlusherWithKey(in, cfg, cfg.APIKey, log, stats)
+}
+
+func newEventsFlusherWithKey(in <-chan EventBatch, cfg Config, apiKey string, log *slog.Logger, stats *selfStats) *eventsFlusher {
 	return &eventsFlusher{
 		in:         in,
 		url:        cfg.GatewayURL + cfg.EventsPath,
-		apiKey:     cfg.APIKey,
+		apiKey:     apiKey,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		log:        log,
 		stats:      stats,
@@ -131,6 +136,11 @@ func (f *eventsFlusher) send(batch EventBatch) {
 			f.stats.BatchesSent.Add(1)
 			f.stats.EventsSent.Add(uint64(len(batch.Events)))
 			f.stats.LastEventFlushMs.Store(time.Now().UnixMilli())
+			if f.pipelineStats != nil {
+				f.pipelineStats.BatchesSent.Add(1)
+				f.pipelineStats.EventsSent.Add(uint64(len(batch.Events)))
+				f.pipelineStats.LastEventFlushMs.Store(time.Now().UnixMilli())
+			}
 			f.log.Debug("events flush ok",
 				"events", len(batch.Events),
 				"bytes", len(body),
@@ -150,6 +160,9 @@ func (f *eventsFlusher) send(batch EventBatch) {
 fail:
 	if cancelled {
 		f.stats.DropsShutdown.Add(uint64(len(batch.Events)))
+		if f.pipelineStats != nil {
+			f.pipelineStats.DropsShutdown.Add(uint64(len(batch.Events)))
+		}
 		f.log.Warn("events flush cancelled by shutdown, dropping batch",
 			"events", len(batch.Events),
 			"err", lastErr,
@@ -157,6 +170,9 @@ fail:
 		return
 	}
 	f.stats.DropsFlushFailed.Add(uint64(len(batch.Events)))
+	if f.pipelineStats != nil {
+		f.pipelineStats.DropsFlushFailed.Add(uint64(len(batch.Events)))
+	}
 	f.log.Warn("events flush failed, dropping batch",
 		"events", len(batch.Events),
 		"err", lastErr,

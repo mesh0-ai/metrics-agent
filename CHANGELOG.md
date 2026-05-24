@@ -4,6 +4,38 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- **Multi-tenant routing.** A single sidecar can now ship events for many
+  mesh0 projects from one host. Callers add an optional top-level
+  `_project` field to each datagram; the agent strips it and POSTs to
+  the matching project's API key. New env var `MESH0_KEYS_FILE` points
+  at a JSON object mapping project → API key, reloaded on `SIGHUP`
+  (atomic-rename when writing). `MESH0_API_KEY` is unchanged for
+  single-tenant deployments and, when both are set, becomes the
+  fallback for datagrams without `_project`. See the README's
+  "Multi-tenant routing" section.
+- **BREAKING:** `MESH0_QUEUE_SIZE` is now **per-pipeline**, not
+  process-wide; its default drops from `10000` to `2000`. Single-tenant
+  deployments registering one (`_default`) pipeline can keep the lower
+  default or set it explicitly. Multi-tenant deployments cap their
+  worst-case in-flight memory at `QUEUE_SIZE × registered projects ×
+  MESH0_MAX_EVENT_BYTES`.
+- New per-project counters surface in `GET /stats` under
+  `by_project.<project>`: `events_received`, `events_sent`,
+  `batches_sent`, `events_dropped.*`, `last_flush_age_ms`. Process-wide
+  totals on the existing top-level keys are unchanged.
+- New drop counters `events_dropped.unrouted_missing_project` and
+  `events_dropped.unrouted_unknown_project` distinguish "datagram had no
+  `_project` and no default key registered" from "datagram named a
+  project we don't have a key for." Alert on either spiking.
+- Project names beginning with `_` are reserved (the agent registers the
+  `MESH0_API_KEY` path under sentinel project `_default`). Keys-file
+  reload rejects such names at parse time and keeps the previous table.
+- `SIGHUP` reloads `MESH0_KEYS_FILE`. The agent diffs the new file
+  against the current routing table: added projects get fresh pipelines,
+  removed projects are drained with `MESH0_SHUTDOWN_GRACE_MS`, and
+  projects whose key rotated are replaced. A parse error keeps the
+  previous table — a bad reload does not take the agent down.
+
 - Per-datagram size cap is now configurable via `MESH0_MAX_EVENT_BYTES`,
   with a new default of **1 MB** (was a hard-coded 32 KB). Range
   `[1 KB, 16 MB]`. Worst-case in-flight memory is `MESH0_QUEUE_SIZE ×

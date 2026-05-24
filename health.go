@@ -11,7 +11,7 @@ import (
 // startHealthServer brings up a tiny HTTP server for k8s probes and basic
 // observability. Returns nil if addr is empty or bind fails (we don't want a
 // missing /healthz to take down the metrics agent — log and continue).
-func startHealthServer(addr string, stats *selfStats, log *slog.Logger) *http.Server {
+func startHealthServer(addr string, stats *selfStats, reg *registry, log *slog.Logger) *http.Server {
 	if addr == "" {
 		return nil
 	}
@@ -27,7 +27,11 @@ func startHealthServer(addr string, stats *selfStats, log *slog.Logger) *http.Se
 	})
 	mux.HandleFunc("/stats", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(stats.snapshot())
+		snap := stats.snapshot()
+		if reg != nil {
+			snap.ByProject = reg.snapshot()
+		}
+		_ = json.NewEncoder(w).Encode(snap)
 	})
 	srv := &http.Server{
 		Handler:           mux,

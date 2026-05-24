@@ -46,7 +46,7 @@ func TestListenRoundTrip(t *testing.T) {
 	log := slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	listenErr := make(chan error, 1)
-	go func() { listenErr <- listen(ctx, sockPath, DefaultMaxEventBytes+1, out, log, stats) }()
+	go func() { listenErr <- listen(ctx, sockPath, DefaultMaxEventBytes+1, chanSink(out), log, stats) }()
 
 	if err := waitForSocket(sockPath, 500*time.Millisecond); err != nil {
 		t.Fatalf("socket not ready: %v", err)
@@ -126,7 +126,7 @@ func TestListenRemovesStaleSocket(t *testing.T) {
 	log := slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	listenErr := make(chan error, 1)
-	go func() { listenErr <- listen(ctx, sockPath, DefaultMaxEventBytes+1, out, log, stats) }()
+	go func() { listenErr <- listen(ctx, sockPath, DefaultMaxEventBytes+1, chanSink(out), log, stats) }()
 
 	if err := waitForSocket(sockPath, 500*time.Millisecond); err != nil {
 		t.Fatalf("socket not ready: %v", err)
@@ -151,7 +151,7 @@ func TestListenRejectsNonSocketFile(t *testing.T) {
 	stats := newSelfStats()
 	log := slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 
-	err := listen(ctx, path, DefaultMaxEventBytes+1, out, log, stats)
+	err := listen(ctx, path, DefaultMaxEventBytes+1, chanSink(out), log, stats)
 	if err == nil {
 		t.Fatal("expected error binding over a non-socket file")
 	}
@@ -187,7 +187,7 @@ func TestListenerOversizeOverWire(t *testing.T) {
 	log := slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	listenErr := make(chan error, 1)
-	go func() { listenErr <- listen(ctx, sockPath, testMaxEventBytes+1, rawCh, log, stats) }()
+	go func() { listenErr <- listen(ctx, sockPath, testMaxEventBytes+1, chanSink(rawCh), log, stats) }()
 	if err := waitForSocket(sockPath, 500*time.Millisecond); err != nil {
 		t.Fatalf("socket not ready: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestListenerOversizeOverWire(t *testing.T) {
 func TestListenRejectsEmptyPath(t *testing.T) {
 	stats := newSelfStats()
 	log := slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	if err := listen(context.Background(), "", DefaultMaxEventBytes+1, make(chan rawDatagram, 1), log, stats); err == nil {
+	if err := listen(context.Background(), "", DefaultMaxEventBytes+1, chanSink(make(chan rawDatagram, 1)), log, stats); err == nil {
 		t.Fatal("expected error from empty path")
 	}
 }
