@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -729,6 +730,147 @@ func BenchmarkExtractAndStripProject_FirstField(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_, _, _, _, _ = extractAndStripProject(in)
 	}
+}
+
+// FuzzExtractAndStripProject backstops the hand-rolled JSON scanner against
+// encoding/json. For every input the corpus produces, the scanner's result
+// must agree with what a decoder-based oracle would have returned. The
+// scanner is allowed to over-reject (return malformed=true on edge cases
+// the stdlib accepts) because the downstream validator (events.go) re-runs
+// json.Valid before the batch ships — but it must NEVER under-reject (let
+// poison bytes through) and must NEVER misroute (produce a different
+// project name for the same input).
+func FuzzExtractAndStripProject(f *testing.F) {
+	for _, seed := range []string{
+		`{"_project":"x"}`,
+		`{"a":1,"_project":"x","b":2}`,
+		`{}`,
+		`{"a":1}`,
+		`[1,2,3]`,
+		`{"_project":42}`,
+		`{"_project":null}`,
+		`{"_project":"a","_project":"b"}`,
+		`{"_project":42,"_project":"b"}`,
+		`{"msg":"contains \"_project\" literally"}`,
+		`{"nested":{"_project":"inner"},"_project":"outer"}`,
+		`{"_project":"with\"escape"}`,
+		`{"_project":"é"}`,
+		`{ "_project" : "x" , "a" : 1 }`,
+		`{"a":1.5e10,"_project":"x"}`,
+		`{"a":-0.1,"_project":"x"}`,
+		`{"a":[1,{"_project":"shadowed"}],"_project":"real"}`,
+	} {
+		f.Add([]byte(seed))
+	}
+
+	f.Fuzz(func(t *testing.T, b []byte) {
+		// Skip inputs that are too large or contain a NUL byte (uncommon in
+		// JSON and trivially malformed; not worth burning cycles on).
+		if len(b) > 16*1024 {
+			return
+		}
+
+		scProj, scOut, scRemoved, scMal, scBad := extractAndStripProject(b)
+
+		// Build the oracle from encoding/json. We only trust the oracle
+		// when the input is a syntactically valid JSON object — that's the
+		// domain the scanner is contracted for.
+		if !json.Valid(b) {
+			// Scanner may report malformed or pass through; either is fine
+			// because the downstream json.Valid in validateEvent will drop
+			// the event regardless. Just check the scanner did not panic
+			// and did not invent a project name from garbage.
+			if scProj != "" && !scMal {
+				// Got a project name out of invalid JSON — must at least
+				// have signaled removed=true (we touched bytes) OR
+				// badProject=true. A non-empty project with
+				// removed=false and malformed=false would be a contract
+				// violation: dispatch would route somewhere real off
+				// invalid input.
+				if !scRemoved && !scBad {
+					t.Fatalf("invented project %q from invalid JSON: %q", scProj, b)
+				}
+			}
+			return
+		}
+
+		// Oracle: top-level walk via json.Decoder.
+		dec := json.NewDecoder(bytes.NewReader(b))
+		tok, err := dec.Token()
+		if err != nil {
+			return
+		}
+		d, isObj := tok.(json.Delim)
+		if !isObj || d != '{' {
+			// Not an object — scanner contract returns malformed=false (the
+			// downstream validator drops it). Scanner must NOT have stripped
+			// or claimed a project.
+			if scRemoved || scProj != "" {
+				t.Fatalf("non-object input %q: scanner returned removed=%v project=%q", b, scRemoved, scProj)
+			}
+			return
+		}
+
+		var oracleProj string
+		var oracleBad bool
+		var oracleHits int
+		for dec.More() {
+			k, err := dec.Token()
+			if err != nil {
+				return
+			}
+			ks := k.(string)
+			var raw json.RawMessage
+			if err := dec.Decode(&raw); err != nil {
+				return
+			}
+			if ks == projectKey {
+				oracleHits++
+				oracleProj = ""
+				oracleBad = true
+				trim := bytes.TrimSpace(raw)
+				if len(trim) > 0 && trim[0] == '"' {
+					var pv string
+					if json.Unmarshal(trim, &pv) == nil {
+						oracleProj = pv
+						oracleBad = false
+					}
+				}
+			}
+		}
+
+		// Scanner may have flagged malformed for edge cases stdlib accepts
+		// (e.g. unusual but legal whitespace inside numbers — there aren't
+		// any, but harden against future divergence). If so, the validator
+		// will drop the event. That's fine; just don't compare further.
+		if scMal {
+			return
+		}
+
+		if oracleHits > 0 != scRemoved {
+			t.Fatalf("removed mismatch on %q: scanner=%v oracle=%v (hits=%d)", b, scRemoved, oracleHits > 0, oracleHits)
+		}
+		if scProj != oracleProj {
+			t.Fatalf("project mismatch on %q: scanner=%q oracle=%q", b, scProj, oracleProj)
+		}
+		if scBad != oracleBad {
+			t.Fatalf("badProject mismatch on %q: scanner=%v oracle=%v", b, scBad, oracleBad)
+		}
+
+		// If we claimed a strip, the output must still be valid JSON and
+		// must not contain a top-level _project.
+		if scRemoved {
+			if !json.Valid(scOut) {
+				t.Fatalf("strip produced invalid JSON on %q -> %q", b, scOut)
+			}
+			var m map[string]json.RawMessage
+			if err := json.Unmarshal(scOut, &m); err == nil {
+				if _, leak := m[projectKey]; leak {
+					t.Fatalf("strip left top-level _project on %q -> %q", b, scOut)
+				}
+			}
+		}
+	})
 }
 
 // chanSink is a single-channel listenSink used by tests that exercise the

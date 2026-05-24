@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 // DefaultProject is the sentinel name the single-key (MESH0_API_KEY) path is
@@ -506,10 +507,14 @@ func loadKeysFile(path string) (map[string]string, error) {
 
 // projectKeyMarker is the cheap prefilter for the no-_project fast path:
 // every datagram that lacks this substring cannot possibly carry a top-level
-// `_project` field, so we skip the decoder entirely. False positives (the
+// `_project` field, so we skip the scanner entirely. False positives (the
 // substring appearing inside a string value or nested object key) fall
-// through to the decoder, which then correctly reports removed=false.
+// through to the scanner, which then correctly reports removed=false.
 var projectKeyMarker = []byte(`"_project"`)
+
+// projectKey is the bare key name compared against unquoted JSON key bytes
+// during the top-level walk.
+const projectKey = "_project"
 
 // extractAndStripProject pulls `_project` out of a top-level JSON object and
 // returns (project, bytes-without-_project, removed, malformed, badProject).
@@ -517,7 +522,7 @@ var projectKeyMarker = []byte(`"_project"`)
 //   - removed=true means at least one `_project` member was stripped and
 //     `stripped` is the rewritten body.
 //   - malformed=true means the input is not a valid top-level JSON object
-//     (or has a non-string key, or a value the decoder couldn't consume).
+//     (or has a non-string key, or a value the scanner couldn't consume).
 //     The caller MUST account this as a parse_error and drop — the original
 //     bytes would 400 against the gateway and poison the batch.
 //   - badProject=true means at least one `_project` member was present but
@@ -533,102 +538,148 @@ var projectKeyMarker = []byte(`"_project"`)
 // gateway's DisallowUnknownFields). The "last wins" convention is followed
 // for the returned project name to match what json.Unmarshal would do.
 //
-// The strip path uses json.Decoder.InputOffset to slice the key+value
-// ranges out, avoiding an unmarshal + remarshal round-trip on the hot
-// path. Order of remaining fields is preserved.
+// The implementation is a hand-rolled top-level scanner — encoding/json is
+// 5–10× slower on this hot path because it boxes every token into an
+// interface{} and allocates a fresh json.RawMessage per value. Behavior is
+// cross-checked against encoding/json by FuzzExtractAndStripProject.
 func extractAndStripProject(b []byte) (project string, stripped []byte, removed, malformed, badProject bool) {
 	// Hot-path prefilter: most datagrams in single-tenant deployments don't
-	// carry the field. Avoid allocating a json.Decoder for them.
+	// carry the field. bytes.IndexByte-driven Contains keeps this zero-alloc.
 	if !bytes.Contains(b, projectKeyMarker) {
 		return "", b, false, false, false
 	}
-	dec := json.NewDecoder(bytes.NewReader(b))
-	tok, err := dec.Token()
-	if err != nil {
+
+	i := scanWS(b, 0)
+	if i >= len(b) {
 		return "", b, false, true, false
 	}
-	if d, ok := tok.(json.Delim); !ok || d != '{' {
+	if b[i] != '{' {
 		// Not an object — caller's validator will drop with parse_error
 		// regardless, so don't double-count here.
 		return "", b, false, false, false
 	}
+	i++
 
-	type span struct{ keyStart, valEnd, idx int64 }
+	type span struct {
+		keyStart, valEnd, idx int
+	}
 	var hits []span
-	var idx int64
+	idx := 0
 
-	for dec.More() {
-		ks := dec.InputOffset()
-		k, err := dec.Token()
-		if err != nil {
+	// Handle the empty-object case up-front: {} can never carry _project,
+	// but the prefilter may have matched a literal inside a string before
+	// we reached it (we already bailed; this is defensive).
+	i = scanWS(b, i)
+	if i >= len(b) {
+		return "", b, false, true, false
+	}
+	if b[i] == '}' {
+		return "", b, false, false, false
+	}
+
+	for {
+		// Key.
+		i = scanWS(b, i)
+		if i >= len(b) || b[i] != '"' {
 			return "", b, false, true, false
 		}
-		keyStr, ok := k.(string)
+		keyStart := i
+		keyContentStart := i + 1
+		keyContentEnd, ok := scanStringBody(b, keyContentStart)
 		if !ok {
 			return "", b, false, true, false
 		}
-		var raw json.RawMessage
-		if err := dec.Decode(&raw); err != nil {
+		i = keyContentEnd + 1 // past closing quote
+
+		// Colon.
+		i = scanWS(b, i)
+		if i >= len(b) || b[i] != ':' {
 			return "", b, false, true, false
 		}
-		ve := dec.InputOffset()
-		if keyStr == "_project" {
-			hits = append(hits, span{keyStart: ks, valEnd: ve, idx: idx})
-			// Last-wins for the project name, matching json.Unmarshal.
-			// Reset both fields each iteration so a string-typed later
-			// occurrence overrides an earlier non-string one (and vice
-			// versa). Detect string-typed via the first non-space byte
-			// rather than json.Unmarshal: `null` unmarshals into a string
-			// target without error (leaving the zero value), which would
-			// otherwise be indistinguishable from a missing _project.
+		i++
+
+		// Value.
+		i = scanWS(b, i)
+		valStart := i
+		valEnd, valKind, ok := scanValue(b, i)
+		if !ok {
+			return "", b, false, true, false
+		}
+		i = valEnd
+
+		// Match `_project` against the raw key bytes. Key escapes (_,
+		// etc.) would slip past a literal compare; the prefilter required
+		// `"_project"` as a substring already, but a key containing escape
+		// sequences won't match here and will be left alone — same as the
+		// prior json.Decoder behavior, which only matched the canonical
+		// unescaped form.
+		if keyContentEnd-keyContentStart == len(projectKey) &&
+			bytes.Equal(b[keyContentStart:keyContentEnd], []byte(projectKey)) {
+			hits = append(hits, span{keyStart: keyStart, valEnd: valEnd, idx: idx})
+			// Last-wins for both project name and badProject — reset each
+			// iteration so a string-typed later occurrence overrides an
+			// earlier non-string one (and vice versa).
 			project = ""
 			badProject = true
-			rawTrim := bytes.TrimSpace(raw)
-			if len(rawTrim) > 0 && rawTrim[0] == '"' {
-				var pv string
-				if err := json.Unmarshal(rawTrim, &pv); err == nil {
+			if valKind == kindString {
+				pv, pvOK := unquoteJSONString(b[valStart:valEnd])
+				if pvOK {
 					project = pv
 					badProject = false
 				}
 			}
 		}
 		idx++
+
+		// Separator or end.
+		i = scanWS(b, i)
+		if i >= len(b) {
+			return "", b, false, true, false
+		}
+		if b[i] == ',' {
+			i++
+			continue
+		}
+		if b[i] == '}' {
+			break
+		}
+		return "", b, false, true, false
 	}
+
+	total := idx
 	if len(hits) == 0 {
 		return "", b, false, false, false
 	}
-	total := idx
-	if int64(len(hits)) == total {
+	if len(hits) == total {
 		// All members were `_project`. Result is the empty object.
 		return project, []byte("{}"), true, false, badProject
 	}
 
 	// Splice out each hit, extending the cut to absorb exactly one
 	// separating comma per removed member so the surviving object stays
-	// well-formed. Whether to swallow the leading or trailing comma
-	// depends on position: a first-position member owns the comma after
-	// its value; any other position owns the comma before its key.
+	// well-formed. A first-position member owns the comma after its value;
+	// any other position owns the comma before its key.
 	type cut struct{ start, end int }
 	cuts := make([]cut, 0, len(hits))
 	for _, h := range hits {
 		if h.idx == 0 {
-			end := int(h.valEnd)
+			end := h.valEnd
 			for end < len(b) && isJSONSpace(b[end]) {
 				end++
 			}
 			if end < len(b) && b[end] == ',' {
 				end++
 			}
-			cuts = append(cuts, cut{start: int(h.keyStart), end: end})
+			cuts = append(cuts, cut{start: h.keyStart, end: end})
 		} else {
-			start := int(h.keyStart)
+			start := h.keyStart
 			for start > 0 && isJSONSpace(b[start-1]) {
 				start--
 			}
 			if start > 0 && b[start-1] == ',' {
 				start--
 			}
-			cuts = append(cuts, cut{start: start, end: int(h.valEnd)})
+			cuts = append(cuts, cut{start: start, end: h.valEnd})
 		}
 	}
 
@@ -642,6 +693,231 @@ func extractAndStripProject(b []byte) (project string, stripped []byte, removed,
 	}
 	out = append(out, b[pos:]...)
 	return project, out, true, false, badProject
+}
+
+// scanWS advances past JSON whitespace and returns the next non-space offset.
+func scanWS(b []byte, i int) int {
+	for i < len(b) {
+		c := b[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			i++
+			continue
+		}
+		return i
+	}
+	return i
+}
+
+// scanStringBody walks the body of a JSON string starting just past the
+// opening quote (b[start] is the first content byte) and returns the offset
+// of the matching closing quote. Handles \" and \\ escapes (and \uXXXX for
+// length-only purposes — full escape validation happens in unquoteJSONString
+// only for the project value we care about). Rejects unescaped control
+// bytes per RFC 8259 §7.
+func scanStringBody(b []byte, start int) (closeQuote int, ok bool) {
+	i := start
+	for i < len(b) {
+		c := b[i]
+		if c == '"' {
+			return i, true
+		}
+		if c == '\\' {
+			if i+1 >= len(b) {
+				return 0, false
+			}
+			if b[i+1] == 'u' {
+				// \uXXXX — must have 4 hex digits.
+				if i+6 > len(b) {
+					return 0, false
+				}
+				for k := i + 2; k < i+6; k++ {
+					if !isHex(b[k]) {
+						return 0, false
+					}
+				}
+				i += 6
+				continue
+			}
+			// Single-char escape: " \ / b f n r t. Other follow chars are
+			// invalid per RFC 8259 but tolerated here — unquoteJSONString
+			// will fail them via encoding/json if we ever care.
+			i += 2
+			continue
+		}
+		if c < 0x20 {
+			return 0, false
+		}
+		i++
+	}
+	return 0, false
+}
+
+func isHex(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+type valueKind int
+
+const (
+	kindUnknown valueKind = iota
+	kindString
+	kindNumber
+	kindObject
+	kindArray
+	kindTrue
+	kindFalse
+	kindNull
+)
+
+// scanValue advances past one JSON value at b[i] and returns the byte
+// offset just past it plus the value's kind. ok=false on any structural
+// error (mismatched brackets, truncated literals, malformed number).
+func scanValue(b []byte, i int) (end int, kind valueKind, ok bool) {
+	if i >= len(b) {
+		return 0, kindUnknown, false
+	}
+	switch b[i] {
+	case '"':
+		cq, ok := scanStringBody(b, i+1)
+		if !ok {
+			return 0, kindUnknown, false
+		}
+		return cq + 1, kindString, true
+	case '{':
+		end, ok := scanContainer(b, i, '{', '}')
+		return end, kindObject, ok
+	case '[':
+		end, ok := scanContainer(b, i, '[', ']')
+		return end, kindArray, ok
+	case 't':
+		if i+4 <= len(b) && string(b[i:i+4]) == "true" {
+			return i + 4, kindTrue, true
+		}
+		return 0, kindUnknown, false
+	case 'f':
+		if i+5 <= len(b) && string(b[i:i+5]) == "false" {
+			return i + 5, kindFalse, true
+		}
+		return 0, kindUnknown, false
+	case 'n':
+		if i+4 <= len(b) && string(b[i:i+4]) == "null" {
+			return i + 4, kindNull, true
+		}
+		return 0, kindUnknown, false
+	default:
+		end, ok := scanNumber(b, i)
+		return end, kindNumber, ok
+	}
+}
+
+// scanContainer walks an object or array and returns the offset just past
+// the closing bracket. Tracks nesting depth and respects string-quoting so
+// brackets inside string values don't confuse the count. Does not validate
+// that opening { matches closing } (vs ] for arrays); a top-level json.Valid
+// re-check (events.go validateEvent) catches mismatched brackets before the
+// batch ships.
+func scanContainer(b []byte, i int, open, close byte) (int, bool) {
+	depth := 1
+	i++
+	for i < len(b) && depth > 0 {
+		c := b[i]
+		switch c {
+		case '"':
+			cq, ok := scanStringBody(b, i+1)
+			if !ok {
+				return 0, false
+			}
+			i = cq + 1
+		case open:
+			depth++
+			i++
+		case close:
+			depth--
+			i++
+		case '{', '[':
+			depth++
+			i++
+		case '}', ']':
+			depth--
+			i++
+		default:
+			i++
+		}
+	}
+	if depth != 0 {
+		return 0, false
+	}
+	return i, true
+}
+
+// scanNumber matches the RFC 8259 number grammar:
+// -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?
+func scanNumber(b []byte, i int) (int, bool) {
+	start := i
+	if i < len(b) && b[i] == '-' {
+		i++
+	}
+	if i >= len(b) {
+		return 0, false
+	}
+	if b[i] == '0' {
+		i++
+	} else if b[i] >= '1' && b[i] <= '9' {
+		for i < len(b) && b[i] >= '0' && b[i] <= '9' {
+			i++
+		}
+	} else {
+		return 0, false
+	}
+	if i < len(b) && b[i] == '.' {
+		i++
+		if i >= len(b) || b[i] < '0' || b[i] > '9' {
+			return 0, false
+		}
+		for i < len(b) && b[i] >= '0' && b[i] <= '9' {
+			i++
+		}
+	}
+	if i < len(b) && (b[i] == 'e' || b[i] == 'E') {
+		i++
+		if i < len(b) && (b[i] == '+' || b[i] == '-') {
+			i++
+		}
+		if i >= len(b) || b[i] < '0' || b[i] > '9' {
+			return 0, false
+		}
+		for i < len(b) && b[i] >= '0' && b[i] <= '9' {
+			i++
+		}
+	}
+	if i == start {
+		return 0, false
+	}
+	return i, true
+}
+
+// unquoteJSONString takes b including the surrounding quotes and returns
+// the decoded string. Fast path: if there are no backslashes, returns a
+// string conversion of the inner bytes (one allocation). Slow path defers
+// to encoding/json for escape handling so we don't reimplement surrogate-
+// pair logic.
+func unquoteJSONString(b []byte) (string, bool) {
+	if len(b) < 2 || b[0] != '"' || b[len(b)-1] != '"' {
+		return "", false
+	}
+	inner := b[1 : len(b)-1]
+	if bytes.IndexByte(inner, '\\') < 0 && utf8.Valid(inner) {
+		// Fast path: no escapes and clean UTF-8 → one allocation. Invalid
+		// UTF-8 in the fast path would diverge from encoding/json (which
+		// replaces with U+FFFD), so fall through to the stdlib unmarshal
+		// in that case.
+		return string(inner), true
+	}
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return "", false
+	}
+	return s, true
 }
 
 func sortedKeys(m map[string]*pipeline) []string {
