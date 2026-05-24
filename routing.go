@@ -513,8 +513,17 @@ func loadKeysFile(path string) (map[string]string, error) {
 var projectKeyMarker = []byte(`"_project"`)
 
 // projectKey is the bare key name compared against unquoted JSON key bytes
-// during the top-level walk.
+// during the top-level walk. projectKeyBytes is the precomputed []byte form
+// used by bytes.Equal so we don't pay []byte(const) per match.
 const projectKey = "_project"
+
+var projectKeyBytes = []byte(projectKey)
+
+// maxScanDepth caps nesting in scanContainer. A 1 MB datagram of nothing but
+// `[` is legal JSON to encoding/json but useless to us; the cap turns
+// adversarial deep nesting into a parse_error drop without affecting any
+// realistic payload.
+const maxScanDepth = 256
 
 // extractAndStripProject pulls `_project` out of a top-level JSON object and
 // returns (project, bytes-without-_project, removed, malformed, badProject).
@@ -566,9 +575,10 @@ func extractAndStripProject(b []byte) (project string, stripped []byte, removed,
 	var hits []span
 	idx := 0
 
-	// Handle the empty-object case up-front: {} can never carry _project,
-	// but the prefilter may have matched a literal inside a string before
-	// we reached it (we already bailed; this is defensive).
+	// Empty-object short-circuit. Without this the loop would fail on the
+	// missing `"` of the (nonexistent) first key and return malformed.
+	// Trailing commas like {"a":1,} are still rejected because the
+	// post-comma branch falls back into the loop's key-quote check.
 	i = scanWS(b, i)
 	if i >= len(b) {
 		return "", b, false, true, false
@@ -607,14 +617,14 @@ func extractAndStripProject(b []byte) (project string, stripped []byte, removed,
 		}
 		i = valEnd
 
-		// Match `_project` against the raw key bytes. Key escapes (_,
-		// etc.) would slip past a literal compare; the prefilter required
-		// `"_project"` as a substring already, but a key containing escape
-		// sequences won't match here and will be left alone — same as the
-		// prior json.Decoder behavior, which only matched the canonical
-		// unescaped form.
+		// Match `_project` against the raw key bytes. A key written with
+		// escape sequences (e.g. "_project") won't match this literal
+		// compare, but the projectKeyMarker prefilter would also have
+		// rejected such inputs before reaching the scanner — so behavior
+		// is consistent with the pre-scanner code path (which never
+		// entered the json.Decoder either).
 		if keyContentEnd-keyContentStart == len(projectKey) &&
-			bytes.Equal(b[keyContentStart:keyContentEnd], []byte(projectKey)) {
+			bytes.Equal(b[keyContentStart:keyContentEnd], projectKeyBytes) {
 			hits = append(hits, span{keyStart: keyStart, valEnd: valEnd, idx: idx})
 			// Last-wins for both project name and badProject — reset each
 			// iteration so a string-typed later occurrence overrides an
@@ -783,12 +793,13 @@ func scanValue(b []byte, i int) (end int, kind valueKind, ok bool) {
 			return 0, kindUnknown, false
 		}
 		return cq + 1, kindString, true
-	case '{':
-		end, ok := scanContainer(b, i, '{', '}')
-		return end, kindObject, ok
-	case '[':
-		end, ok := scanContainer(b, i, '[', ']')
-		return end, kindArray, ok
+	case '{', '[':
+		end, ok := scanContainer(b, i)
+		kind := kindObject
+		if b[i] == '[' {
+			kind = kindArray
+		}
+		return end, kind, ok
 	case 't':
 		if i+4 <= len(b) && string(b[i:i+4]) == "true" {
 			return i + 4, kindTrue, true
@@ -811,13 +822,39 @@ func scanValue(b []byte, i int) (end int, kind valueKind, ok bool) {
 }
 
 // scanContainer walks an object or array and returns the offset just past
-// the closing bracket. Tracks nesting depth and respects string-quoting so
-// brackets inside string values don't confuse the count. Does not validate
-// that opening { matches closing } (vs ] for arrays); a top-level json.Valid
-// re-check (events.go validateEvent) catches mismatched brackets before the
-// batch ships.
-func scanContainer(b []byte, i int, open, close byte) (int, bool) {
-	depth := 1
+// the matching closing bracket. Uses an explicit bracket stack so that
+// mismatched pairs like `[1, 2}` are rejected as malformed at the routing
+// layer (rather than relying on the downstream json.Valid re-check, which
+// would mis-attribute the parse_error to the pipeline-stats layer).
+// Respects string-quoting so brackets inside string values don't confuse
+// the count. Bounded by maxScanDepth to defang adversarial deeply-nested
+// input.
+func scanContainer(b []byte, i int) (int, bool) {
+	var stack [maxScanDepth]byte
+	depth := 0
+	push := func(open byte) bool {
+		if depth >= maxScanDepth {
+			return false
+		}
+		stack[depth] = open
+		depth++
+		return true
+	}
+	pop := func(close byte) bool {
+		if depth == 0 {
+			return false
+		}
+		depth--
+		want := byte('}')
+		if stack[depth] == '[' {
+			want = ']'
+		}
+		return want == close
+	}
+
+	if !push(b[i]) {
+		return 0, false
+	}
 	i++
 	for i < len(b) && depth > 0 {
 		c := b[i]
@@ -828,17 +865,15 @@ func scanContainer(b []byte, i int, open, close byte) (int, bool) {
 				return 0, false
 			}
 			i = cq + 1
-		case open:
-			depth++
-			i++
-		case close:
-			depth--
-			i++
 		case '{', '[':
-			depth++
+			if !push(c) {
+				return 0, false
+			}
 			i++
 		case '}', ']':
-			depth--
+			if !pop(c) {
+				return 0, false
+			}
 			i++
 		default:
 			i++
