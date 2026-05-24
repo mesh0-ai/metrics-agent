@@ -40,7 +40,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.MaxBatch != 500 {
 		t.Errorf("MaxBatch default: got %d", cfg.MaxBatch)
 	}
-	if cfg.QueueSize != 10_000 {
+	if cfg.QueueSize != 2_000 {
 		t.Errorf("QueueSize default: got %d", cfg.QueueSize)
 	}
 	if cfg.MaxRetries != 4 {
@@ -58,6 +58,21 @@ func TestLoadConfigRequiresAPIKey(t *testing.T) {
 	clearMesh0Env(t)
 	if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "MESH0_API_KEY") {
 		t.Fatalf("expected MESH0_API_KEY required error, got %v", err)
+	}
+}
+
+func TestLoadConfigAcceptsKeysFileWithoutAPIKey(t *testing.T) {
+	clearMesh0Env(t)
+	t.Setenv("MESH0_KEYS_FILE", "/some/path.json")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.KeysFile != "/some/path.json" {
+		t.Errorf("KeysFile: got %q", cfg.KeysFile)
+	}
+	if cfg.APIKey != "" {
+		t.Errorf("APIKey: got %q", cfg.APIKey)
 	}
 }
 
@@ -246,6 +261,7 @@ func clearMesh0Env(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{
 		"MESH0_API_KEY",
+		"MESH0_KEYS_FILE",
 		"MESH0_BASE_URL",
 		"MESH0_EVENTS_PATH",
 		"MESH0_LISTEN_PATH",

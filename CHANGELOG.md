@@ -4,6 +4,74 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- **Multi-tenant routing.** A single sidecar can now ship events for many
+  mesh0 projects from one host. Callers add an optional top-level
+  `_project` field to each datagram; the agent strips it and POSTs to
+  the matching project's API key. New env var `MESH0_KEYS_FILE` points
+  at a JSON object mapping project → API key, reloaded on `SIGHUP`
+  (atomic-rename when writing). `MESH0_API_KEY` is unchanged for
+  single-tenant deployments and, when both are set, becomes the
+  fallback for datagrams without `_project`. See the README's
+  "Multi-tenant routing" section.
+- **BREAKING:** `MESH0_QUEUE_SIZE` is now **per-pipeline**, not
+  process-wide; its default drops from `10000` to `2000`. Single-tenant
+  deployments registering one (`_default`) pipeline can keep the lower
+  default or set it explicitly. Multi-tenant deployments cap their
+  worst-case in-flight memory at `QUEUE_SIZE × registered projects ×
+  MESH0_MAX_EVENT_BYTES`.
+- New per-project counters surface in `GET /stats` under
+  `by_project.<project>`: `events_received`, `events_sent`,
+  `batches_sent`, `events_dropped.*`, `last_flush_age_ms`. Process-wide
+  totals on the existing top-level keys are unchanged.
+- New drop counters `events_dropped.unrouted_missing_project` and
+  `events_dropped.unrouted_unknown_project` distinguish "datagram had no
+  `_project` and no default key registered" from "datagram named a
+  project we don't have a key for." Alert on either spiking.
+- Project names beginning with `_` are reserved (the agent registers the
+  `MESH0_API_KEY` path under sentinel project `_default`). Keys-file
+  reload rejects such names at parse time and keeps the previous table.
+- `SIGHUP` reloads `MESH0_KEYS_FILE`. The agent diffs the new file
+  against the current routing table: added projects get fresh pipelines,
+  removed projects are drained with `MESH0_SHUTDOWN_GRACE_MS`, and
+  projects whose key rotated are replaced. A parse error keeps the
+  previous table — a bad reload does not take the agent down.
+- New `/stats` fields `keys_reload_failures` (counter, cumulative) and
+  `last_keys_reload_unix` (unix-seconds of the most recent successful
+  reload). Alert on `keys_reload_failures > 0` paired with a stale
+  `last_keys_reload_unix` to catch operators running on a frozen routing
+  table after a bad keys-file push.
+- A datagram whose `_project` field is structurally malformed JSON is
+  now accounted as `events_dropped.parse_error` at the routing layer
+  instead of being forwarded verbatim (which would 4xx the whole batch
+  at the gateway).
+- A datagram whose `_project` value is well-formed JSON but **not a
+  string** (number, null, object, array) is now accounted as
+  `events_dropped.unrouted_unknown_project` instead of silently
+  defaulting to the `MESH0_API_KEY` fallback. Catches misbehaving
+  client SDKs that would otherwise cross-attribute to whichever tenant
+  owns the default key.
+- New env var `MESH0_MAX_PROJECTS` (default `64`, range `[1, 4096]`)
+  caps the number of registered pipelines. Each pipeline costs
+  `QueueSize × MaxEventBytes` of worst-case in-flight memory plus two
+  goroutines and an `http.Client`; a misconfigured keys file with one
+  entry per request-id would otherwise OOM the 32Mi sidecar. `install`
+  fails fast over the cap; `SIGHUP` reload over the cap is rejected and
+  bumps `keys_reload_failures` (previous table is kept).
+- New env var `MESH0_REQUIRE_PROJECT` (default `false`). When set, the
+  `MESH0_API_KEY` fallback is disabled for datagrams arriving without a
+  `_project` field — they drop as `unrouted_missing_project` instead.
+  Recommended for multi-tenant deployments to surface mis-tagged
+  callers rather than silently cross-attributing them.
+- New drop counter `events_dropped.routing_closed` (per-project and
+  process-wide). Distinguishes "a SIGHUP reload retired this pipeline
+  between lookup and send" from genuine queue saturation, so a
+  `queue_full` alert isn't triggered by reload churn.
+- `MESH0_KEYS_FILE` is now opened with `O_NOFOLLOW` and rejected if it
+  is a symlink, a non-regular file, world-writable, or larger than
+  1 MiB. Operators should keep it mode `0600` (or `0640`); a writable
+  keys file is effectively a root credential for every registered
+  tenant.
+
 - Per-datagram size cap is now configurable via `MESH0_MAX_EVENT_BYTES`,
   with a new default of **1 MB** (was a hard-coded 32 KB). Range
   `[1 KB, 16 MB]`. Worst-case in-flight memory is `MESH0_QUEUE_SIZE ×

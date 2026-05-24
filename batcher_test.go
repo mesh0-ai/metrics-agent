@@ -234,7 +234,7 @@ func TestListenerDropsOnFullQueue(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_ = listen(ctx, sockPath, DefaultMaxEventBytes+1, rawCh, log, stats)
+		_ = listen(ctx, sockPath, DefaultMaxEventBytes+1, chanSink(rawCh), log, stats)
 	}()
 	if err := waitForSocket(sockPath, 500*time.Millisecond); err != nil {
 		t.Fatalf("socket not ready: %v", err)
@@ -291,7 +291,7 @@ func TestListenerDispatchesJSON(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_ = listen(ctx, sockPath, DefaultMaxEventBytes+1, rawCh, log, stats)
+		_ = listen(ctx, sockPath, DefaultMaxEventBytes+1, chanSink(rawCh), log, stats)
 	}()
 	if err := waitForSocket(sockPath, 500*time.Millisecond); err != nil {
 		t.Fatalf("socket not ready: %v", err)

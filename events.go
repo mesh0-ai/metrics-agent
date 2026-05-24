@@ -148,6 +148,7 @@ type eventsBatcher struct {
 	in            <-chan rawDatagram
 	out           chan<- EventBatch
 	stats         *selfStats
+	pipelineStats *pipelineStats // optional; nil when not multi-tenant routed
 	log           *slog.Logger
 	maxEvents     int
 	maxEventBytes int
@@ -224,10 +225,19 @@ func (b *eventsBatcher) run() {
 			switch reason {
 			case validateOversize:
 				b.stats.DropsOversize.Add(1)
+				if b.pipelineStats != nil {
+					b.pipelineStats.DropsOversize.Add(1)
+				}
 				continue
 			case validateParseError:
 				b.stats.DropsParseError.Add(1)
+				if b.pipelineStats != nil {
+					b.pipelineStats.DropsParseError.Add(1)
+				}
 				continue
+			}
+			if b.pipelineStats != nil {
+				b.pipelineStats.EventsReceived.Add(1)
 			}
 			if len(b.cur) > 0 && b.curBytes+len(ev)+1 > MaxBatchBytes {
 				b.flush()
@@ -268,6 +278,9 @@ func (b *eventsBatcher) flush() {
 		// Flusher is gone or the grace timer fired during a wedged POST.
 		// Account for the dropped events instead of blocking forever.
 		b.stats.DropsShutdown.Add(uint64(len(batch.Events)))
+		if b.pipelineStats != nil {
+			b.pipelineStats.DropsShutdown.Add(uint64(len(batch.Events)))
+		}
 		b.log.Warn("batcher abandoning batch on shutdown",
 			"events", len(batch.Events))
 	}

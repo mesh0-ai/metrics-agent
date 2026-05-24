@@ -19,6 +19,7 @@ var Version = "dev"
 // container ships with no flags to remember.
 type Config struct {
 	APIKey        string
+	KeysFile      string
 	GatewayURL    string
 	EventsPath    string
 	ListenPath    string
@@ -30,11 +31,24 @@ type Config struct {
 	MaxRetries    int
 	ShutdownGrace time.Duration
 	LogLevel      slog.Level
+	// MaxProjects bounds the number of registered pipelines (including the
+	// MESH0_API_KEY fallback). Each pipeline owns a per-project queue, two
+	// goroutines, and an http.Client — worst-case in-flight memory is
+	// MaxProjects * QueueSize * MaxEventBytes. A misconfigured keys file
+	// (e.g. one entry per request_id) would otherwise OOM the sidecar.
+	MaxProjects int
+	// RequireProject disables the MESH0_API_KEY fallback for datagrams
+	// arriving without a `_project` field. Recommended for multi-tenant
+	// deployments to surface mis-tagged callers as `unrouted_missing_project`
+	// rather than silently cross-attributing to whatever tenant owns the
+	// default key.
+	RequireProject bool
 }
 
 func loadConfig() (Config, error) {
 	c := Config{
 		APIKey:        os.Getenv("MESH0_API_KEY"),
+		KeysFile:      os.Getenv("MESH0_KEYS_FILE"),
 		GatewayURL:    envOr("MESH0_BASE_URL", "https://api.mesh0.ai"),
 		EventsPath:    envOr("MESH0_EVENTS_PATH", "/v1/events"),
 		ListenPath:    envOr("MESH0_LISTEN_PATH", "/run/mesh0/agent.sock"),
@@ -42,10 +56,14 @@ func loadConfig() (Config, error) {
 		BatchWindow:   200 * time.Millisecond,
 		MaxBatch:      500,
 		MaxEventBytes: DefaultMaxEventBytes,
-		QueueSize:     10_000,
+		// Per-pipeline default. Multi-tenant deployments register one
+		// pipeline per project, so the process-wide ceiling is
+		// (QueueSize * registered projects).
+		QueueSize:     2_000,
 		MaxRetries:    4,
 		ShutdownGrace: 15 * time.Second,
 		LogLevel:      slog.LevelInfo,
+		MaxProjects:   64,
 	}
 	if v := os.Getenv("MESH0_BATCH_WINDOW_MS"); v != "" {
 		ms, err := strconv.Atoi(v)
@@ -89,6 +107,23 @@ func loadConfig() (Config, error) {
 		}
 		c.ShutdownGrace = time.Duration(ms) * time.Millisecond
 	}
+	if v := os.Getenv("MESH0_MAX_PROJECTS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 4096 {
+			return c, fmt.Errorf("MESH0_MAX_PROJECTS must be an integer in [1, 4096]")
+		}
+		c.MaxProjects = n
+	}
+	if v := os.Getenv("MESH0_REQUIRE_PROJECT"); v != "" {
+		switch v {
+		case "1", "true", "TRUE":
+			c.RequireProject = true
+		case "0", "false", "FALSE":
+			c.RequireProject = false
+		default:
+			return c, fmt.Errorf("MESH0_REQUIRE_PROJECT must be 1|0|true|false")
+		}
+	}
 	if v := os.Getenv("MESH0_LOG_LEVEL"); v != "" {
 		switch v {
 		case "debug":
@@ -103,8 +138,8 @@ func loadConfig() (Config, error) {
 			return c, fmt.Errorf("MESH0_LOG_LEVEL must be debug|info|warn|error")
 		}
 	}
-	if c.APIKey == "" {
-		return c, errors.New("MESH0_API_KEY is required")
+	if c.APIKey == "" && c.KeysFile == "" {
+		return c, errors.New("set MESH0_API_KEY (single-tenant) or MESH0_KEYS_FILE (multi-tenant)")
 	}
 	if c.ListenPath == "" {
 		return c, errors.New("MESH0_LISTEN_PATH is required")
@@ -140,41 +175,42 @@ func main() {
 		"max_batch", cfg.MaxBatch,
 		"max_event_bytes", cfg.MaxEventBytes,
 		"queue_size", cfg.QueueSize,
+		"keys_file", cfg.KeysFile,
 	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
 	stats := newSelfStats()
-	rawCh := make(chan rawDatagram, cfg.QueueSize)
-	batchCh := make(chan EventBatch, 8)
 
-	batcher := newEventsBatcher(rawCh, batchCh, stats, log, cfg.MaxBatch, cfg.MaxEventBytes, cfg.BatchWindow)
-	flush := newEventsFlusher(batchCh, cfg, log, stats)
+	reg := newRegistry(cfg, log, stats)
+	if err := reg.install(); err != nil {
+		fmt.Fprintln(os.Stderr, "routing:", err)
+		os.Exit(2)
+	}
 
-	flushCtx, flushCancel := context.WithCancel(context.Background())
-	flush.ctx = flushCtx
-	batcher.ctx = flushCtx
+	healthSrv := startHealthServer(cfg.HealthAddr, stats, reg, log)
 
-	healthSrv := startHealthServer(cfg.HealthAddr, stats, log)
+	// SIGHUP reloads the keys file. Done on a separate signal channel so it
+	// doesn't compete with the SIGINT/SIGTERM shutdown context above.
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	defer signal.Stop(hupCh)
+	hupDone := make(chan struct{})
+	go func() {
+		defer close(hupDone)
+		for {
+			select {
+			case <-hupCh:
+				reg.reload()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
-	// Shutdown chain:
-	//   ctx -> listener returns -> close(rawCh) -> batcher emits final
-	//   batch and returns -> close(batchCh) -> flusher drains.
 	listenerErr := make(chan error, 1)
-	go func() { listenerErr <- listen(ctx, cfg.ListenPath, cfg.MaxEventBytes+1, rawCh, log, stats) }()
-
-	batcherDone := make(chan struct{})
-	go func() {
-		batcher.run()
-		close(batcherDone)
-	}()
-
-	flushDone := make(chan struct{})
-	go func() {
-		flush.run()
-		close(flushDone)
-	}()
+	go func() { listenerErr <- listen(ctx, cfg.ListenPath, cfg.MaxEventBytes+1, reg, log, stats) }()
 
 	select {
 	case <-ctx.Done():
@@ -188,31 +224,9 @@ func main() {
 		cancel()
 	}
 
-	close(rawCh)
+	<-hupDone
 
-	// Arm the grace timer before waiting on the batcher: if the flusher is
-	// wedged (slow POST + full batchCh), the batcher's final flush would
-	// block forever on send. Firing flushCancel after grace lets both the
-	// flusher's in-flight POST and the batcher's final flush abort, the
-	// latter accounting its events as drops.shutdown.
-	var graceTimer *time.Timer
-	if cfg.ShutdownGrace > 0 {
-		graceTimer = time.AfterFunc(cfg.ShutdownGrace, func() {
-			log.Warn("shutdown grace exceeded, cancelling in-flight flushes",
-				"grace", cfg.ShutdownGrace)
-			flushCancel()
-		})
-	} else {
-		flushCancel()
-	}
-
-	<-batcherDone
-	close(batchCh)
-	<-flushDone
-	if graceTimer != nil {
-		graceTimer.Stop()
-	}
-	flushCancel()
+	reg.shutdown(cfg.ShutdownGrace)
 
 	if healthSrv != nil {
 		shutCtx, shutCancel := context.WithTimeout(context.Background(), 2*time.Second)
