@@ -23,6 +23,16 @@ import (
 // API key is the fallback for unrouted datagrams).
 const DefaultProject = "_default"
 
+// pipelineHandoffDepth is the per-pipeline rawCh capacity. With Plan B's
+// shared queue absorbing bursts, the per-pipeline channel only needs enough
+// slack to decouple the demuxer goroutine from the batcher goroutine. A
+// noisy project that overruns this depth gets its own per-pipeline
+// queue_full drops without consuming the shared budget. Sized so worst-case
+// per-pipeline memory (depth * MaxEventBytes) stays bounded across many
+// projects: 16 * 1 MB * 64 projects ≈ 1 GiB ceiling, dwarfed by the shared
+// queue contribution.
+const pipelineHandoffDepth = 16
+
 // pipeline holds the per-project channels + goroutines that drain a single
 // project's events to the gateway. One pipeline per registered API key.
 //
@@ -82,7 +92,9 @@ func (p *pipeline) trySend(dg rawDatagram) (delivered, closed, queueFull bool) {
 // Caller must invoke start() to launch the goroutines.
 func newPipeline(project, apiKey string, cfg Config, log *slog.Logger, processStats *selfStats) *pipeline {
 	pstats := newPipelineStats()
-	rawCh := make(chan rawDatagram, cfg.QueueSize)
+	// Per-pipeline handoff buffer. The big in-flight buffer is the
+	// registry's shared queue; this just decouples demuxer from batcher.
+	rawCh := make(chan rawDatagram, pipelineHandoffDepth)
 	batchCh := make(chan EventBatch, 8)
 
 	plog := log.With("project", project)
@@ -160,12 +172,41 @@ type routingTable struct {
 
 // registry owns the live routing table plus the inputs needed to reload it.
 // Methods are safe for concurrent use.
+//
+// Plan B architecture: one process-wide bounded queue (sharedRawCh) absorbs
+// listener bursts. A single demuxer goroutine drains it and routes each
+// datagram to its pipeline's small handoff channel. This makes the total
+// in-flight memory ceiling O(QueueSize × MaxEventBytes), independent of the
+// number of registered projects — and lets operators set a single sizing
+// knob that matches the sidecar's memory limit. Trade-off: one slow project
+// that fills its handoff channel accounts to its own per-project
+// queue_full; one project that monopolises the shared queue (sustained
+// high traffic against a wedged flusher) can starve the rest. For the 99%
+// case where projects belong to the same customer that's acceptable; a
+// tenant that needs isolation should run a dedicated agent.
 type registry struct {
 	cur atomic.Pointer[routingTable]
 
 	cfg          Config
 	log          *slog.Logger
 	processStats *selfStats
+
+	// sharedRawCh is the process-wide bounded queue between dispatch and
+	// the demuxer. Cap = cfg.QueueSize. Sized to match the sidecar's
+	// memory budget (depth × MaxEventBytes worst-case).
+	sharedRawCh chan rawDatagram
+	// demuxDone closes when the demuxer goroutine has drained sharedRawCh
+	// after it was closed. shutdown() waits on this before draining
+	// pipelines to ensure no in-flight datagrams are stranded.
+	demuxDone chan struct{}
+	// sharedSendMu guards sharedRawCh against send-after-close.
+	// Hot-path dispatchers take RLock for the send; closeShared takes
+	// Lock to flip sharedClosed and close(sharedRawCh) under exclusion.
+	// Same canonical fix as the per-pipeline sendMu, now sized to a
+	// single process-wide mutex instead of one per pipeline.
+	sharedSendMu    sync.RWMutex
+	sharedClosed    bool
+	sharedCloseOnce sync.Once
 
 	// reloadMu serialises SIGHUP handlers so two concurrent signals cannot
 	// produce diverging tables. Read path (lookup) is lock-free via
@@ -186,7 +227,17 @@ type registry struct {
 }
 
 func newRegistry(cfg Config, log *slog.Logger, processStats *selfStats) *registry {
-	return &registry{cfg: cfg, log: log, processStats: processStats}
+	qs := cfg.QueueSize
+	if qs <= 0 {
+		qs = 2000
+	}
+	return &registry{
+		cfg:          cfg,
+		log:          log,
+		processStats: processStats,
+		sharedRawCh:  make(chan rawDatagram, qs),
+		demuxDone:    make(chan struct{}),
+	}
 }
 
 // install seeds the registry from the initial config (MESH0_API_KEY +
@@ -220,11 +271,53 @@ func (r *registry) install() error {
 		p.start()
 	}
 	r.cur.Store(tbl)
+	// Start the demuxer AFTER pipelines are running so its first lookup
+	// always resolves to a started pipeline.
+	go r.demux()
 	r.log.Info("routing installed",
 		"projects", sortedKeys(tbl.pipelines),
 		"has_default", tbl.hasDefault,
+		"shared_queue_size", cap(r.sharedRawCh),
 	)
 	return nil
+}
+
+// demux drains sharedRawCh and forwards each datagram to its pipeline's
+// handoff channel. Runs in its own goroutine; exits when sharedRawCh is
+// closed (by shutdown). The lookup is performed against the live routing
+// table — a project removed by SIGHUP between dispatch and demux is
+// accounted as routing_closed.
+func (r *registry) demux() {
+	defer close(r.demuxDone)
+	for dg := range r.sharedRawCh {
+		p, ok := r.lookup(dg.project)
+		if !ok {
+			// Project disappeared between dispatch and demux (SIGHUP
+			// reload removed it after the datagram was queued). Account
+			// as routing_closed rather than re-deriving the original
+			// missing/unknown reason — the datagram was successfully
+			// routed at dispatch time, the destination went away.
+			r.processStats.DropsRoutingClosed.Add(1)
+			continue
+		}
+		delivered, closed, full := p.trySend(dg)
+		switch {
+		case delivered:
+			// nothing to account; batcher will bump pipelineStats after
+			// validateEvent succeeds.
+		case closed:
+			p.stats.DropsRoutingClosed.Add(1)
+			r.processStats.DropsRoutingClosed.Add(1)
+		case full:
+			// Per-project handoff buffer overflow. Reserved for the
+			// pipeline's own counter — the shared-queue overflow path
+			// (process-wide DropsQueueFull) is bumped at dispatch when
+			// sharedRawCh itself is full. Distinguishing the two lets
+			// operators tell "the whole agent is back-pressured" from
+			// "this one project's batcher/flusher is stuck."
+			p.stats.DropsQueueFull.Add(1)
+		}
+	}
 }
 
 // reload re-reads the keys file and diffs against the current table. Added
@@ -355,19 +448,28 @@ func (r *registry) lookup(project string) (*pipeline, bool) {
 // pipeline based on the `_project` field; strips `_project` so the gateway
 // sees the original CustomEventInput shape. The listener has already bumped
 // the process-wide EventsReceived counter; per-project EventsReceived is
-// bumped by the batcher after validation. Drops route to:
-//   - DropsParseError (process-wide) when the routing-strip pass finds the
-//     payload is not a JSON object.
-//   - DropsUnrouted{Missing,Unknown} (process-wide) for routing-layer drops,
-//     including non-string `_project` values (treated as unknown — the JSON
-//     is well-formed but unusable for routing).
-//   - DropsQueueFull (per-pipeline and process-wide) for queue saturation.
-//   - DropsRoutingClosed (per-pipeline and process-wide) when the destination
-//     pipeline was drained between lookup and send (SIGHUP reload race).
+// bumped by the batcher after validation.
 //
-// The listener also bumps process-wide DropsQueueFull when we return
-// queueFull=true. Closed-pipeline drops do NOT signal queueFull — they
-// would mis-attribute reload churn to back-pressure.
+// Plan B: dispatch parses + validates routability + checks the destination
+// pipeline isn't already closed, then enqueues onto the shared queue. The
+// demuxer goroutine does the actual pipeline.trySend. Splitting it this way
+// preserves the original synchronous accounting for routing-time drops
+// (unrouted_*, routing_closed of an already-drained pipeline) while moving
+// the per-pipeline handoff onto an async path that doesn't block the
+// listener's read loop.
+//
+// Drops route to:
+//   - DropsParseError (process-wide) when routing-strip finds non-JSON-object.
+//   - DropsUnrouted{Missing,Unknown} (process-wide) when no pipeline matches,
+//     including non-string `_project` values.
+//   - DropsRoutingClosed (per-pipeline + process-wide) when the destination
+//     pipeline was already closed at dispatch time (SIGHUP reload race).
+//   - DropsQueueFull (process-wide) when the shared queue is full —
+//     signalled to the listener via queueFull=true so the listener bumps it.
+//
+// Per-pipeline DropsQueueFull is bumped in the demuxer when the pipeline's
+// own handoff buffer is full (a single noisy project), distinct from
+// process-wide queue_full (shared queue exhausted).
 func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
 	project, stripped, removed, malformed, badProject := extractAndStripProject(dg.bytes)
 	if malformed {
@@ -394,25 +496,61 @@ func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
 		}
 		return false, false
 	}
-	delivered, closed, full := p.trySend(dg)
-	switch {
-	case delivered:
-		return true, false
-	case closed:
+	// Early closed-pipeline check. If the pipeline was already drained at
+	// dispatch time (pre-drain in tests, or a reload that retired the
+	// project before this dispatch fired), short-circuit with synchronous
+	// routing_closed accounting. The demuxer also handles the closed case
+	// for the dispatch→demux race window, but doing it here too keeps the
+	// caller's view of "did this drop happen yet?" synchronous, which is
+	// what the existing closed-pipeline test asserts.
+	p.sendMu.RLock()
+	pclosed := p.closed
+	p.sendMu.RUnlock()
+	if pclosed {
 		p.stats.DropsRoutingClosed.Add(1)
 		r.processStats.DropsRoutingClosed.Add(1)
 		return false, false
-	case full:
-		p.stats.DropsQueueFull.Add(1)
+	}
+	// Stamp project so the demuxer can route without re-parsing. May be ""
+	// when routing to DefaultProject — lookup() handles that case.
+	dg.project = project
+	// Manual RUnlock (no defer) — this is the listener's hot path; the
+	// defer overhead is measurable here and the function is small enough
+	// that the early returns below are easy to audit by eye.
+	r.sharedSendMu.RLock()
+	if r.sharedClosed {
+		r.sharedSendMu.RUnlock()
+		// Shutdown in progress; account as routing_closed for the
+		// destination pipeline so this drop is attributable. Not
+		// queueFull (the queue may have had capacity; the agent is
+		// just exiting).
+		p.stats.DropsRoutingClosed.Add(1)
+		r.processStats.DropsRoutingClosed.Add(1)
+		return false, false
+	}
+	select {
+	case r.sharedRawCh <- dg:
+		r.sharedSendMu.RUnlock()
+		return true, false
+	default:
+		r.sharedSendMu.RUnlock()
 		return false, true
 	}
-	return false, false
 }
 
 // shutdown drains every pipeline. Called from main on SIGINT/SIGTERM after
 // the listener has stopped accepting new datagrams. Also waits for any
 // reload-initiated drains so SIGHUP-then-SIGTERM doesn't orphan goroutines.
+//
+// Ordering matters: close the shared queue and wait the demuxer to exit
+// before touching pipelines, so the demuxer doesn't race a pipeline.drain
+// (which sets closed and closes pipeline.rawCh).
 func (r *registry) shutdown(grace time.Duration) {
+	// Close-once guard: a test may install() then defer shutdown(0)
+	// alongside an explicit shutdown call. Closing twice would panic.
+	r.closeShared()
+	<-r.demuxDone
+
 	t := r.cur.Load()
 	if t == nil {
 		r.drainsInFlight.Wait()
@@ -428,6 +566,18 @@ func (r *registry) shutdown(grace time.Duration) {
 	}
 	wg.Wait()
 	r.drainsInFlight.Wait()
+}
+
+// closeShared closes sharedRawCh once under exclusion against in-flight
+// dispatch sends. Idempotent so callers don't have to coordinate; tests
+// that defer shutdown(0) alongside an explicit shutdown still work.
+func (r *registry) closeShared() {
+	r.sharedCloseOnce.Do(func() {
+		r.sharedSendMu.Lock()
+		r.sharedClosed = true
+		close(r.sharedRawCh)
+		r.sharedSendMu.Unlock()
+	})
 }
 
 // snapshot returns a per-project view of pipeline counters for /stats.

@@ -13,12 +13,25 @@ All notable changes to this project are documented here.
   single-tenant deployments and, when both are set, becomes the
   fallback for datagrams without `_project`. See the README's
   "Multi-tenant routing" section.
-- **BREAKING:** `MESH0_QUEUE_SIZE` is now **per-pipeline**, not
-  process-wide; its default drops from `10000` to `2000`. Single-tenant
-  deployments registering one (`_default`) pipeline can keep the lower
-  default or set it explicitly. Multi-tenant deployments cap their
-  worst-case in-flight memory at `QUEUE_SIZE × registered projects ×
-  MESH0_MAX_EVENT_BYTES`.
+- **BREAKING:** `MESH0_QUEUE_SIZE` reverts to **process-wide** with a
+  single shared queue feeding a demuxer that fans datagrams out to
+  per-project pipelines. Each pipeline now owns only a small 16-slot
+  handoff buffer. The shared queue's worst-case in-flight memory is
+  `QUEUE_SIZE × MESH0_MAX_EVENT_BYTES`, independent of project count;
+  the handoff buffers add `16 × registered_projects ×
+  MESH0_MAX_EVENT_BYTES` on top, which is dominated by the shared
+  queue at modest project counts but grows linearly with
+  `MESH0_MAX_PROJECTS` (at the 4096 cap, lower `MESH0_MAX_EVENT_BYTES`
+  to keep the handoff contribution bounded). The same `QUEUE_SIZE`
+  setting now matches one fixed shared-queue budget rather than
+  scaling with project count. The trade-off: a single project that
+  monopolises the shared queue can back-pressure the others — fine for
+  related projects under one customer, not fine for hostile-tenant
+  isolation (run separate agents for that).
+- Per-project `events_dropped.queue_full` (visible in `by_project`)
+  now means a specific project's 16-slot handoff buffer overflowed,
+  not the shared queue. Process-wide `events_dropped.queue_full`
+  continues to count shared-queue exhaustion.
 - New per-project counters surface in `GET /stats` under
   `by_project.<project>`: `events_received`, `events_sent`,
   `batches_sent`, `events_dropped.*`, `last_flush_age_ms`. Process-wide
