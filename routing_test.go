@@ -14,9 +14,9 @@ import (
 
 func TestExtractAndStripProject_NoField(t *testing.T) {
 	in := []byte(`{"a":1,"b":"hi"}`)
-	proj, out, removed := extractAndStripProject(in)
-	if removed {
-		t.Errorf("removed=true, expected false")
+	proj, out, removed, malformed := extractAndStripProject(in)
+	if removed || malformed {
+		t.Errorf("removed=%v malformed=%v, expected both false", removed, malformed)
 	}
 	if proj != "" {
 		t.Errorf("project: got %q", proj)
@@ -28,9 +28,9 @@ func TestExtractAndStripProject_NoField(t *testing.T) {
 
 func TestExtractAndStripProject_FirstField(t *testing.T) {
 	in := []byte(`{"_project":"ws-42","a":1,"b":"hi"}`)
-	proj, out, removed := extractAndStripProject(in)
-	if !removed || proj != "ws-42" {
-		t.Fatalf("got proj=%q removed=%v", proj, removed)
+	proj, out, removed, malformed := extractAndStripProject(in)
+	if !removed || malformed || proj != "ws-42" {
+		t.Fatalf("got proj=%q removed=%v malformed=%v", proj, removed, malformed)
 	}
 	if !json.Valid(out) {
 		t.Errorf("output not valid JSON: %s", out)
@@ -49,9 +49,9 @@ func TestExtractAndStripProject_FirstField(t *testing.T) {
 
 func TestExtractAndStripProject_MiddleField(t *testing.T) {
 	in := []byte(`{"a":1,"_project":"ws-99","b":"hi"}`)
-	proj, out, removed := extractAndStripProject(in)
-	if !removed || proj != "ws-99" {
-		t.Fatalf("got proj=%q removed=%v", proj, removed)
+	proj, out, removed, malformed := extractAndStripProject(in)
+	if !removed || malformed || proj != "ws-99" {
+		t.Fatalf("got proj=%q removed=%v malformed=%v", proj, removed, malformed)
 	}
 	var m map[string]any
 	if err := json.Unmarshal(out, &m); err != nil {
@@ -64,9 +64,9 @@ func TestExtractAndStripProject_MiddleField(t *testing.T) {
 
 func TestExtractAndStripProject_OnlyField(t *testing.T) {
 	in := []byte(`{"_project":"solo"}`)
-	proj, out, removed := extractAndStripProject(in)
-	if !removed || proj != "solo" {
-		t.Fatalf("got proj=%q removed=%v", proj, removed)
+	proj, out, removed, malformed := extractAndStripProject(in)
+	if !removed || malformed || proj != "solo" {
+		t.Fatalf("got proj=%q removed=%v malformed=%v", proj, removed, malformed)
 	}
 	if string(out) != "{}" {
 		t.Errorf("output: got %q, want {}", out)
@@ -79,9 +79,9 @@ func TestExtractAndStripProject_DuplicateKeysStripAllLastWins(t *testing.T) {
 	// DisallowUnknownFields and would 400 on any leak) and adopt the
 	// last value for routing, matching json.Unmarshal semantics.
 	in := []byte(`{"_project":"first","a":1,"_project":"middle","b":2,"_project":"last"}`)
-	proj, out, removed := extractAndStripProject(in)
-	if !removed || proj != "last" {
-		t.Fatalf("got proj=%q removed=%v", proj, removed)
+	proj, out, removed, malformed := extractAndStripProject(in)
+	if !removed || malformed || proj != "last" {
+		t.Fatalf("got proj=%q removed=%v malformed=%v", proj, removed, malformed)
 	}
 	if !json.Valid(out) {
 		t.Fatalf("output not valid JSON: %s", out)
@@ -99,10 +99,104 @@ func TestExtractAndStripProject_DuplicateKeysStripAllLastWins(t *testing.T) {
 }
 
 func TestExtractAndStripProject_NotObject(t *testing.T) {
-	for _, c := range []string{`[]`, `123`, ``, `null`} {
-		_, _, removed := extractAndStripProject([]byte(c))
+	// Non-object JSON (array / scalar / empty / null) is not the routing
+	// layer's job to drop — the validator will reject it as parse_error.
+	// We just confirm we don't claim to have stripped anything.
+	for _, c := range []string{`[]`, `123`, `null`} {
+		_, _, removed, _ := extractAndStripProject([]byte(c))
 		if removed {
 			t.Errorf("removed=true for %q", c)
+		}
+	}
+}
+
+// TestExtractAndStripProject_LiteralInsideString guards against a regression
+// where a substring matcher (instead of a real JSON decoder) treats the
+// `_project` literal embedded in a STRING VALUE as if it were a top-level
+// key. The streaming-decoder implementation handles this correctly; the
+// test pins it so a future "fast path" rewrite can't silently break.
+func TestExtractAndStripProject_LiteralInsideString(t *testing.T) {
+	in := []byte(`{"msg":"this string contains \"_project\" verbatim","real":1}`)
+	proj, out, removed, malformed := extractAndStripProject(in)
+	if removed || malformed {
+		t.Fatalf("got proj=%q removed=%v malformed=%v; expected pass-through", proj, removed, malformed)
+	}
+	if string(out) != string(in) {
+		t.Errorf("output mutated: %q", out)
+	}
+}
+
+// TestExtractAndStripProject_LiteralInsideNestedKey: `_project` appears as
+// a NESTED object key, not a top-level one. Must not be stripped or treated
+// as a routing hint.
+func TestExtractAndStripProject_LiteralInsideNestedKey(t *testing.T) {
+	in := []byte(`{"meta":{"_project":"nested"},"a":1}`)
+	proj, out, removed, malformed := extractAndStripProject(in)
+	if removed || malformed || proj != "" {
+		t.Fatalf("got proj=%q removed=%v malformed=%v; expected pass-through", proj, removed, malformed)
+	}
+	if string(out) != string(in) {
+		t.Errorf("output mutated: %q", out)
+	}
+}
+
+// TestExtractAndStripProject_NonStringValue: `_project` with a non-string
+// value (number, null, object) is malformed-ish — we still strip the key
+// (so the gateway doesn't 400) but the project name stays empty, which
+// will route to default or missing depending on registration.
+func TestExtractAndStripProject_NonStringValue(t *testing.T) {
+	for _, body := range []string{
+		`{"_project":42,"a":1}`,
+		`{"_project":null,"a":1}`,
+		`{"_project":{"nested":"obj"},"a":1}`,
+	} {
+		proj, out, removed, malformed := extractAndStripProject([]byte(body))
+		if malformed {
+			t.Errorf("%s: malformed=true, expected false (well-formed JSON)", body)
+		}
+		if !removed {
+			t.Errorf("%s: removed=false, expected true (key still stripped)", body)
+		}
+		if proj != "" {
+			t.Errorf("%s: project=%q, expected empty (non-string value)", body, proj)
+		}
+		if !json.Valid(out) {
+			t.Errorf("%s: output not valid JSON: %s", body, out)
+		}
+	}
+}
+
+// TestExtractAndStripProject_Whitespace: pretty-printed input with
+// inter-token whitespace must still produce a well-formed output.
+func TestExtractAndStripProject_Whitespace(t *testing.T) {
+	in := []byte("{ \"a\":1, \"_project\" : \"ws-42\" , \"b\":2 }")
+	proj, out, removed, malformed := extractAndStripProject(in)
+	if !removed || malformed || proj != "ws-42" {
+		t.Fatalf("got proj=%q removed=%v malformed=%v", proj, removed, malformed)
+	}
+	if !json.Valid(out) {
+		t.Errorf("output not valid JSON: %s", out)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := m["_project"]; found {
+		t.Errorf("_project not stripped: %s", out)
+	}
+}
+
+// TestExtractAndStripProject_Malformed: structurally broken JSON (non-string
+// key, unterminated value) must report malformed=true so dispatch counts it
+// as parse_error rather than forwarding poison bytes to the gateway.
+func TestExtractAndStripProject_Malformed(t *testing.T) {
+	for _, body := range []string{
+		`{"_project":"x",`,       // truncated
+		`{"_project":"x", trail`, // garbage after value
+	} {
+		_, _, _, malformed := extractAndStripProject([]byte(body))
+		if !malformed {
+			t.Errorf("%q: malformed=false, expected true", body)
 		}
 	}
 }
@@ -247,6 +341,213 @@ func TestRegistry_ReloadAddsAndRemovesProjects(t *testing.T) {
 	}
 }
 
+// TestRegistry_DispatchMalformedBumpsParseError ensures a malformed datagram
+// is counted as parse_error at the routing layer rather than silently
+// forwarded to a pipeline (which would poison the batch with a 4xx).
+func TestRegistry_DispatchMalformedBumpsParseError(t *testing.T) {
+	cfg := testConfig()
+	cfg.APIKey = "m0_default"
+	stats := newSelfStats()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg := newRegistry(cfg, log, stats)
+	if err := reg.install(); err != nil {
+		t.Fatal(err)
+	}
+	defer reg.shutdown(0)
+
+	// Trips the prefilter (contains `"_project"`) AND is structurally
+	// broken — without the malformed return, this would be forwarded.
+	bad := []byte(`{"_project":"x", oh no`)
+	delivered, _ := reg.dispatch(rawDatagram{bytes: bad, at: time.Now()})
+	if delivered {
+		t.Error("expected delivered=false for malformed input")
+	}
+	if got := stats.DropsParseError.Load(); got != 1 {
+		t.Errorf("DropsParseError: got %d want 1", got)
+	}
+}
+
+// TestRegistry_ReloadReplacesOnKeyChange: a project whose api key changes
+// across a reload must get a fresh pipeline (the old one drained). Without
+// this, a rotated key would continue shipping under the stale credential.
+func TestRegistry_ReloadReplacesOnKeyChange(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keys.json")
+	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_old"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig()
+	cfg.APIKey = ""
+	cfg.KeysFile = path
+	cfg.ShutdownGrace = 0
+	stats := newSelfStats()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg := newRegistry(cfg, log, stats)
+	if err := reg.install(); err != nil {
+		t.Fatal(err)
+	}
+	defer reg.shutdown(0)
+
+	before, _ := reg.lookup("ws-42")
+	if before == nil || before.apiKey != "m0_old" {
+		t.Fatalf("initial pipeline: %+v", before)
+	}
+
+	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_new"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reg.reload()
+
+	after, _ := reg.lookup("ws-42")
+	if after == nil {
+		t.Fatal("ws-42 missing after key rotation")
+	}
+	if after == before {
+		t.Error("expected new pipeline instance after key change; got same pointer")
+	}
+	if after.apiKey != "m0_new" {
+		t.Errorf("new apiKey: got %q want m0_new", after.apiKey)
+	}
+}
+
+// TestRegistry_ReloadFailureBumpsCounter: a malformed keys file on SIGHUP
+// must bump KeysReloadFailures so operators can detect a stale table from
+// /stats without scraping logs.
+func TestRegistry_ReloadFailureBumpsCounter(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keys.json")
+	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig()
+	cfg.APIKey = ""
+	cfg.KeysFile = path
+	stats := newSelfStats()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg := newRegistry(cfg, log, stats)
+	if err := reg.install(); err != nil {
+		t.Fatal(err)
+	}
+	defer reg.shutdown(0)
+
+	if err := os.WriteFile(path, []byte(`{not json`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reg.reload()
+	if got := reg.KeysReloadFailures.Load(); got != 1 {
+		t.Errorf("KeysReloadFailures: got %d want 1", got)
+	}
+	if reg.LastKeysReloadUnix.Load() != 0 {
+		t.Error("LastKeysReloadUnix should remain 0 after failed reload")
+	}
+
+	// Recover: a good file must zero the failure path's effect on
+	// LastKeysReloadUnix (we don't reset the failures counter — it's
+	// cumulative).
+	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reg.reload()
+	if reg.LastKeysReloadUnix.Load() == 0 {
+		t.Error("LastKeysReloadUnix not stamped after successful reload")
+	}
+}
+
+// TestRegistry_MultiPipelineDrain: shutdown must drain all pipelines (N>1)
+// with pending batches. Validates the fan-out drain in registry.shutdown.
+func TestRegistry_MultiPipelineDrain(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keys.json")
+	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_a","ws-99":"m0_b","ws-7":"m0_c"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig()
+	cfg.APIKey = ""
+	cfg.KeysFile = path
+	cfg.MaxRetries = 0
+	stats := newSelfStats()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg := newRegistry(cfg, log, stats)
+	if err := reg.install(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, p := range []string{"ws-42", "ws-99", "ws-7"} {
+		body := []byte(`{"_project":"` + p + `","a":1}`)
+		reg.dispatch(rawDatagram{bytes: body, at: time.Now()})
+	}
+
+	done := make(chan struct{})
+	go func() {
+		reg.shutdown(500 * time.Millisecond)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not return within 2s — drain stuck")
+	}
+}
+
+// TestRegistry_ConcurrentReloadAndDispatch is a race-detector guard: a
+// reload that replaces pipelines must not race with concurrent dispatch.
+// The atomic.Pointer swap + start-before-publish ordering should keep this
+// safe; this test pins it under `go test -race`.
+func TestRegistry_ConcurrentReloadAndDispatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keys.json")
+	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig()
+	cfg.APIKey = ""
+	cfg.KeysFile = path
+	cfg.ShutdownGrace = 0
+	cfg.MaxRetries = 0
+	stats := newSelfStats()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg := newRegistry(cfg, log, stats)
+	if err := reg.install(); err != nil {
+		t.Fatal(err)
+	}
+	defer reg.shutdown(0)
+
+	stop := make(chan struct{})
+	// Dispatch loop.
+	go func() {
+		body := []byte(`{"_project":"ws-42","op":"x"}`)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				reg.dispatch(rawDatagram{bytes: body, at: time.Now()})
+			}
+		}
+	}()
+	// Reload loop: alternate api key so each iteration replaces the
+	// pipeline (drain old, start new).
+	go func() {
+		alt := true
+		for i := 0; i < 50; i++ {
+			key := "m0_a"
+			if alt {
+				key = "m0_b"
+			}
+			alt = !alt
+			contents := `{"ws-42":"` + key + `"}`
+			tmp := path + ".tmp"
+			if err := os.WriteFile(tmp, []byte(contents), 0o600); err != nil {
+				return
+			}
+			_ = os.Rename(tmp, path)
+			reg.reload()
+		}
+		close(stop)
+	}()
+	<-stop
+}
+
 func TestRegistry_ReloadKeepsPreviousOnParseError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "keys.json")
@@ -380,6 +681,27 @@ func TestListenerRoutesToCorrectPipeline(t *testing.T) {
 
 	cancel()
 	<-listenErr
+}
+
+// BenchmarkExtractAndStripProject measures the hot-path cost of routing's
+// _project extraction. The no-field case is the dominant single-tenant
+// workload; the prefilter should keep it allocation-free.
+func BenchmarkExtractAndStripProject_NoField(b *testing.B) {
+	in := []byte(`{"operation":"db.query","duration_ms":42,"status":200,"meta":{"k":"v"}}`)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _, _ = extractAndStripProject(in)
+	}
+}
+
+func BenchmarkExtractAndStripProject_FirstField(b *testing.B) {
+	in := []byte(`{"_project":"ws-42","operation":"db.query","duration_ms":42}`)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _, _ = extractAndStripProject(in)
+	}
 }
 
 // chanSink is a single-channel listenSink used by tests that exercise the

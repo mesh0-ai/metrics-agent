@@ -35,6 +35,15 @@ All notable changes to this project are documented here.
   removed projects are drained with `MESH0_SHUTDOWN_GRACE_MS`, and
   projects whose key rotated are replaced. A parse error keeps the
   previous table — a bad reload does not take the agent down.
+- New `/stats` fields `keys_reload_failures` (counter, cumulative) and
+  `last_keys_reload_unix` (unix-seconds of the most recent successful
+  reload). Alert on `keys_reload_failures > 0` paired with a stale
+  `last_keys_reload_unix` to catch operators running on a frozen routing
+  table after a bad keys-file push.
+- A datagram whose `_project` field is structurally malformed JSON is
+  now accounted as `events_dropped.parse_error` at the routing layer
+  instead of being forwarded verbatim (which would 4xx the whole batch
+  at the gateway).
 
 - Per-datagram size cap is now configurable via `MESH0_MAX_EVENT_BYTES`,
   with a new default of **1 MB** (was a hard-coded 32 KB). Range

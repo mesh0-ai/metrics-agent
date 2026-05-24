@@ -45,6 +45,32 @@ type pipeline struct {
 
 	batcherDone chan struct{}
 	flushDone   chan struct{}
+
+	// sendMu guards rawCh against concurrent send-after-close. dispatch
+	// takes RLock for the send (multiple senders coexist); drain takes
+	// Lock to flip closed and close(rawCh) under exclusion. This is the
+	// canonical fix for the send-on-closed-channel panic that's otherwise
+	// possible when reload swaps a pipeline while a dispatch is in flight.
+	sendMu sync.RWMutex
+	closed bool
+}
+
+// trySend delivers dg to the pipeline's input queue without blocking. The
+// closed return is true when the pipeline has already been drained — the
+// caller should account this as queue_full (capacity ran out before the
+// drain ordering caught up) rather than panic.
+func (p *pipeline) trySend(dg rawDatagram) (delivered, queueFull bool) {
+	p.sendMu.RLock()
+	defer p.sendMu.RUnlock()
+	if p.closed {
+		return false, true
+	}
+	select {
+	case p.rawCh <- dg:
+		return true, false
+	default:
+		return false, true
+	}
 }
 
 // newPipeline wires a project's batcher + flusher with the supplied config.
@@ -93,11 +119,15 @@ func (p *pipeline) start() {
 }
 
 // drain closes the pipeline's input channel, waits for the batcher to emit
-// its final partial batch, then waits for the flusher to drain. graceTimer,
-// if non-nil, cancels the pipeline context after firing so a wedged POST
-// cannot prevent shutdown.
+// its final partial batch, then waits for the flusher to drain. If grace > 0
+// the pipeline context is cancelled after that duration so a wedged POST
+// cannot prevent shutdown; if grace == 0 the context is cancelled immediately
+// (best-effort flush, no wait).
 func (p *pipeline) drain(grace time.Duration) {
+	p.sendMu.Lock()
+	p.closed = true
 	close(p.rawCh)
+	p.sendMu.Unlock()
 
 	var graceTimer *time.Timer
 	if grace > 0 {
@@ -119,7 +149,7 @@ func (p *pipeline) drain(grace time.Duration) {
 type routingTable struct {
 	pipelines map[string]*pipeline
 	// hasDefault is true when DefaultProject is registered. Cached so the
-	// no-_project lookup is one map miss instead of two.
+	// empty-`_project` fast path skips a map lookup.
 	hasDefault bool
 }
 
@@ -136,6 +166,18 @@ type registry struct {
 	// produce diverging tables. Read path (lookup) is lock-free via
 	// atomic.Pointer.
 	reloadMu sync.Mutex
+
+	// drainsInFlight tracks reload-initiated drain goroutines so shutdown
+	// can wait on them and they aren't orphaned if SIGHUP races SIGTERM.
+	drainsInFlight sync.WaitGroup
+
+	// KeysReloadFailures counts SIGHUP reloads that gave up after the
+	// retry (the previous routing table is kept). Surfaced in /stats so
+	// operators can detect a stale routing table without scraping logs.
+	KeysReloadFailures atomic.Uint64
+	// LastKeysReloadUnix is the unix-seconds timestamp of the most recent
+	// successful keys-file reload (0 if no reload has succeeded yet).
+	LastKeysReloadUnix atomic.Int64
 }
 
 func newRegistry(cfg Config, log *slog.Logger, processStats *selfStats) *registry {
@@ -164,10 +206,12 @@ func (r *registry) install() error {
 		return errors.New("no API keys configured (set MESH0_API_KEY or MESH0_KEYS_FILE)")
 	}
 	tbl := r.buildTable(keys, nil)
-	r.cur.Store(tbl)
+	// Start pipelines BEFORE publishing the table so dispatch can never
+	// land a datagram on a pipeline whose goroutines aren't running yet.
 	for _, p := range tbl.pipelines {
 		p.start()
 	}
+	r.cur.Store(tbl)
 	r.log.Info("routing installed",
 		"projects", sortedKeys(tbl.pipelines),
 		"has_default", tbl.hasDefault,
@@ -200,6 +244,7 @@ func (r *registry) reload() {
 		time.Sleep(50 * time.Millisecond)
 		fileKeys, err = loadKeysFile(r.cfg.KeysFile)
 		if err != nil {
+			r.KeysReloadFailures.Add(1)
 			r.log.Error("keys file reload failed, keeping previous table", "err", err)
 			return
 		}
@@ -215,9 +260,9 @@ func (r *registry) reload() {
 
 	prev := r.cur.Load()
 	tbl := r.buildTable(newKeys, prev)
-	r.cur.Store(tbl)
 
-	// Start any freshly-spawned pipelines.
+	// Start any freshly-spawned pipelines BEFORE swapping the table, so
+	// dispatch never lands on a pipeline whose goroutines aren't running.
 	for name, p := range tbl.pipelines {
 		if prev != nil {
 			if old, ok := prev.pipelines[name]; ok && old == p {
@@ -227,15 +272,24 @@ func (r *registry) reload() {
 		p.start()
 	}
 
-	// Drain pipelines that are gone or replaced.
+	r.cur.Store(tbl)
+
+	// Drain pipelines that are gone or replaced. Track on a WaitGroup so
+	// a SIGTERM that races with a reload doesn't orphan these goroutines
+	// past the process exit (reg.shutdown waits on r.drainsInFlight).
 	if prev != nil {
 		for name, old := range prev.pipelines {
 			if cur, ok := tbl.pipelines[name]; !ok || cur != old {
-				go old.drain(r.cfg.ShutdownGrace)
+				r.drainsInFlight.Add(1)
+				go func(p *pipeline) {
+					defer r.drainsInFlight.Done()
+					p.drain(r.cfg.ShutdownGrace)
+				}(old)
 			}
 		}
 	}
 
+	r.LastKeysReloadUnix.Store(time.Now().Unix())
 	r.log.Info("routing reloaded",
 		"projects", sortedKeys(tbl.pipelines),
 		"has_default", tbl.hasDefault,
@@ -280,11 +334,18 @@ func (r *registry) lookup(project string) (*pipeline, bool) {
 
 // dispatch implements listenSink. Routes a datagram to its project's
 // pipeline based on the `_project` field; strips `_project` so the gateway
-// sees the original CustomEventInput shape. Drops are accounted at the
-// process level (DropsUnrouted{Missing,Unknown}) and not propagated as
-// queue_full so the listener doesn't double-count.
+// sees the original CustomEventInput shape. The listener has already bumped
+// the process-wide EventsReceived counter; per-project EventsReceived is
+// bumped by the batcher after validation. Drops route to
+// DropsUnrouted{Missing,Unknown} (process-wide) for routing-layer drops,
+// and per-pipeline DropsQueueFull for saturation (the listener also bumps
+// the process-wide DropsQueueFull when we return queueFull=true).
 func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
-	project, stripped, removed := extractAndStripProject(dg.bytes)
+	project, stripped, removed, malformed := extractAndStripProject(dg.bytes)
+	if malformed {
+		r.processStats.DropsParseError.Add(1)
+		return false, false
+	}
 	if removed {
 		dg.bytes = stripped
 	}
@@ -297,21 +358,24 @@ func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
 		}
 		return false, false
 	}
-	r.processStats.EventsReceived.Add(1)
-	select {
-	case p.rawCh <- dg:
+	delivered, full := p.trySend(dg)
+	if delivered {
 		return true, false
-	default:
+	}
+	if full {
 		p.stats.DropsQueueFull.Add(1)
 		return false, true
 	}
+	return false, false
 }
 
 // shutdown drains every pipeline. Called from main on SIGINT/SIGTERM after
-// the listener has stopped accepting new datagrams.
+// the listener has stopped accepting new datagrams. Also waits for any
+// reload-initiated drains so SIGHUP-then-SIGTERM doesn't orphan goroutines.
 func (r *registry) shutdown(grace time.Duration) {
 	t := r.cur.Load()
 	if t == nil {
+		r.drainsInFlight.Wait()
 		return
 	}
 	var wg sync.WaitGroup
@@ -323,6 +387,7 @@ func (r *registry) shutdown(grace time.Duration) {
 		}(p)
 	}
 	wg.Wait()
+	r.drainsInFlight.Wait()
 }
 
 // snapshot returns a per-project view of pipeline counters for /stats.
@@ -348,7 +413,6 @@ func loadKeysFile(path string) (map[string]string, error) {
 	}
 	var raw map[string]string
 	dec := json.NewDecoder(bytes.NewReader(b))
-	dec.DisallowUnknownFields()
 	if err := dec.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("parse keys file: %w", err)
 	}
@@ -366,10 +430,24 @@ func loadKeysFile(path string) (map[string]string, error) {
 	return raw, nil
 }
 
+// projectKeyMarker is the cheap prefilter for the no-_project fast path:
+// every datagram that lacks this substring cannot possibly carry a top-level
+// `_project` field, so we skip the decoder entirely. False positives (the
+// substring appearing inside a string value or nested object key) fall
+// through to the decoder, which then correctly reports removed=false.
+var projectKeyMarker = []byte(`"_project"`)
+
 // extractAndStripProject pulls `_project` out of a top-level JSON object and
-// returns (project, bytes-without-_project, true). If the input is not a
-// JSON object or `_project` is absent, returns ("", original, false) — the
-// caller still routes/validates, treating the input as having no project.
+// returns (project, bytes-without-_project, removed, malformed).
+//
+//   - removed=true means at least one `_project` member was stripped and
+//     `stripped` is the rewritten body.
+//   - malformed=true means the input is not a valid top-level JSON object
+//     (or has a non-string key, or a value the decoder couldn't consume).
+//     The caller MUST account this as a parse_error and drop — the original
+//     bytes would 400 against the gateway and poison the batch.
+//   - removed=false, malformed=false means the input is a JSON object with
+//     no `_project` (the common case).
 //
 // All occurrences of `_project` are stripped (duplicate top-level keys are
 // non-canonical JSON, but leaking even one through would 400 against the
@@ -379,14 +457,21 @@ func loadKeysFile(path string) (map[string]string, error) {
 // The strip path uses json.Decoder.InputOffset to slice the key+value
 // ranges out, avoiding an unmarshal + remarshal round-trip on the hot
 // path. Order of remaining fields is preserved.
-func extractAndStripProject(b []byte) (project string, stripped []byte, removed bool) {
+func extractAndStripProject(b []byte) (project string, stripped []byte, removed, malformed bool) {
+	// Hot-path prefilter: most datagrams in single-tenant deployments don't
+	// carry the field. Avoid allocating a json.Decoder for them.
+	if !bytes.Contains(b, projectKeyMarker) {
+		return "", b, false, false
+	}
 	dec := json.NewDecoder(bytes.NewReader(b))
 	tok, err := dec.Token()
 	if err != nil {
-		return "", b, false
+		return "", b, false, true
 	}
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return "", b, false
+		// Not an object — caller's validator will drop with parse_error
+		// regardless, so don't double-count here.
+		return "", b, false, false
 	}
 
 	type span struct{ keyStart, valEnd, idx int64 }
@@ -397,15 +482,15 @@ func extractAndStripProject(b []byte) (project string, stripped []byte, removed 
 		ks := dec.InputOffset()
 		k, err := dec.Token()
 		if err != nil {
-			return "", b, false
+			return "", b, false, true
 		}
 		keyStr, ok := k.(string)
 		if !ok {
-			return "", b, false
+			return "", b, false, true
 		}
 		var raw json.RawMessage
 		if err := dec.Decode(&raw); err != nil {
-			return "", b, false
+			return "", b, false, true
 		}
 		ve := dec.InputOffset()
 		if keyStr == "_project" {
@@ -419,12 +504,12 @@ func extractAndStripProject(b []byte) (project string, stripped []byte, removed 
 		idx++
 	}
 	if len(hits) == 0 {
-		return "", b, false
+		return "", b, false, false
 	}
 	total := idx
 	if int64(len(hits)) == total {
 		// All members were `_project`. Result is the empty object.
-		return project, []byte("{}"), true
+		return project, []byte("{}"), true, false
 	}
 
 	// Splice out each hit, extending the cut to absorb exactly one
@@ -465,7 +550,7 @@ func extractAndStripProject(b []byte) (project string, stripped []byte, removed 
 		pos = c.end
 	}
 	out = append(out, b[pos:]...)
-	return project, out, true
+	return project, out, true, false
 }
 
 func sortedKeys(m map[string]*pipeline) []string {

@@ -30,6 +30,8 @@ func startHealthServer(addr string, stats *selfStats, reg *registry, log *slog.L
 		snap := stats.snapshot()
 		if reg != nil {
 			snap.ByProject = reg.snapshot()
+			snap.KeysReloadFailures = reg.KeysReloadFailures.Load()
+			snap.LastKeysReloadUnix = reg.LastKeysReloadUnix.Load()
 		}
 		_ = json.NewEncoder(w).Encode(snap)
 	})

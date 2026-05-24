@@ -49,6 +49,11 @@ type statsSnapshot struct {
 	ListenerFatal  bool                            `json:"listener_fatal"`
 	UptimeS        int64                           `json:"uptime_s"`
 	ByProject      map[string]projectStatsSnapshot `json:"by_project,omitempty"`
+	// KeysReloadFailures and LastKeysReloadUnix surface the health of the
+	// SIGHUP keys-file reload path. A non-zero failure count with a stale
+	// LastKeysReloadUnix means operators are running on an outdated table.
+	KeysReloadFailures uint64 `json:"keys_reload_failures,omitempty"`
+	LastKeysReloadUnix int64  `json:"last_keys_reload_unix,omitempty"`
 }
 
 type dropStats struct {
