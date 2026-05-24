@@ -194,10 +194,10 @@ All knobs are environment variables.
 | `MESH0_BATCH_WINDOW_MS`   | `200`                  | Max age of an event before its batch flushes. |
 | `MESH0_MAX_BATCH`         | `500`                  | Max events per batch (≤ 5000 server cap).  |
 | `MESH0_MAX_EVENT_BYTES`   | `1048576` (1 MB)       | Per-datagram size ceiling. Range `[1024, 16777216]`. Datagrams larger than this are dropped (`drops.oversize`). The listener allocates a single pooled read buffer of this size + 1 byte; raising it enlarges the agent's resident memory floor. Senders (and on Linux, `net.core.{wmem,rmem}_max`) must also permit datagrams of this size. |
-| `MESH0_QUEUE_SIZE`        | `2000`                 | **Per-pipeline** bounded queue depth. Multi-tenant deployments register one pipeline per project, so the process-wide ceiling is `QUEUE_SIZE × registered projects`. Worst-case in-flight memory per pipeline is `QUEUE_SIZE × MESH0_MAX_EVENT_BYTES`. |
+| `MESH0_QUEUE_SIZE`        | `2000`                 | **Process-wide** bounded queue depth between the listener and the per-project demuxer. Worst-case in-flight memory is `QUEUE_SIZE × MESH0_MAX_EVENT_BYTES`, *independent of the number of registered projects* (each project also owns a small 16-slot handoff buffer, negligible vs. the shared queue). Size to match your sidecar's memory limit. |
 | `MESH0_MAX_RETRIES`       | `4`                    | Retry budget per batch on 429/5xx/network. |
 | `MESH0_SHUTDOWN_GRACE_MS` | `15000`                | Max wait for in-flight flushes on exit.    |
-| `MESH0_MAX_PROJECTS`      | `64`                   | Cap on registered pipelines (incl. `_default`). Range `[1, 4096]`. Each pipeline costs `QUEUE_SIZE × MAX_EVENT_BYTES` of in-flight memory plus two goroutines and an `http.Client`; a misconfigured keys file with one entry per request-id would otherwise OOM the sidecar. `install` fails fast over the cap; `SIGHUP` reload over the cap is rejected and bumps `keys_reload_failures`. |
+| `MESH0_MAX_PROJECTS`      | `64`                   | Cap on registered pipelines (incl. `_default`). Range `[1, 4096]`. Each pipeline costs two goroutines, an `http.Client`, and a 16-slot handoff buffer (`16 × MAX_EVENT_BYTES` worst case). A misconfigured keys file with one entry per request-id would otherwise spawn unbounded goroutines. `install` fails fast over the cap; `SIGHUP` reload over the cap is rejected and bumps `keys_reload_failures`. |
 | `MESH0_REQUIRE_PROJECT`   | `false`                | When set, datagrams arriving without a `_project` field are **not** routed to the `MESH0_API_KEY` fallback — they drop as `unrouted_missing_project`. Recommended for multi-tenant deployments where silently cross-attributing to the default tenant would be a tagging bug. |
 | `MESH0_LOG_LEVEL`         | `info`                 | `debug` \| `info` \| `warn` \| `error`     |
 
@@ -324,9 +324,13 @@ it. Four loss points, all observable in `/stats`:
    `/proc/net/unix` queue depth if you suspect them, and check
    `buffer_degraded` in `/stats` to confirm the kernel accepted the
    buffer request.
-2. **Agent queue full** (`drops.queue_full`) — internal `rawCh` is
-   bounded by `MESH0_QUEUE_SIZE`. The listener never blocks; if the
-   batcher is behind, the newest datagram is dropped.
+2. **Agent queue full** (`drops.queue_full`) — process-wide shared
+   queue between the listener and the demuxer is bounded by
+   `MESH0_QUEUE_SIZE`. The listener never blocks; if the demuxer is
+   behind, the newest datagram is dropped. Per-project `queue_full`
+   (only visible in `by_project`, not the top-level counter) indicates
+   one project's 16-slot handoff buffer is full while the shared queue
+   still has capacity — a single project's batcher/flusher is wedged.
 3. **Flush failures** (`drops.flush_failed`) — gateway 4xx (non-429),
    or 429/5xx after `MESH0_MAX_RETRIES`.
 4. **Unrouted** (`drops.unrouted_missing_project`,

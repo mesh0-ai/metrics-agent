@@ -38,9 +38,14 @@ const MaxBatchBytes = 10 * 1024 * 1024
 // rawDatagram is one UDS-DGRAM payload destined for the JSON event path. The bytes
 // are owned by this struct (already copied off the listener's pooled read
 // buffer) — receivers can keep them.
+//
+// project is stamped by the routing layer's dispatch (after _project extraction)
+// so the demuxer goroutine can route the datagram to its pipeline without
+// re-parsing. An empty project means the datagram routes to DefaultProject.
 type rawDatagram struct {
-	bytes []byte
-	at    time.Time
+	bytes   []byte
+	at      time.Time
+	project string
 }
 
 // EventBatch is the unit handed to the events flusher. The Events slice is a
