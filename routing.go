@@ -371,9 +371,14 @@ func loadKeysFile(path string) (map[string]string, error) {
 // JSON object or `_project` is absent, returns ("", original, false) — the
 // caller still routes/validates, treating the input as having no project.
 //
-// The strip path uses json.Decoder.InputOffset to slice the key+value out,
-// avoiding an unmarshal + remarshal round-trip on the hot path. Order of
-// remaining fields is preserved.
+// All occurrences of `_project` are stripped (duplicate top-level keys are
+// non-canonical JSON, but leaking even one through would 400 against the
+// gateway's DisallowUnknownFields). The "last wins" convention is followed
+// for the returned project name to match what json.Unmarshal would do.
+//
+// The strip path uses json.Decoder.InputOffset to slice the key+value
+// ranges out, avoiding an unmarshal + remarshal round-trip on the hot
+// path. Order of remaining fields is preserved.
 func extractAndStripProject(b []byte) (project string, stripped []byte, removed bool) {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	tok, err := dec.Token()
@@ -384,8 +389,9 @@ func extractAndStripProject(b []byte) (project string, stripped []byte, removed 
 		return "", b, false
 	}
 
-	var keyStart, valEnd int64 = -1, -1
-	var foundIdx, idx int = -1, 0
+	type span struct{ keyStart, valEnd, idx int64 }
+	var hits []span
+	var idx int64
 
 	for dec.More() {
 		ks := dec.InputOffset()
@@ -402,48 +408,63 @@ func extractAndStripProject(b []byte) (project string, stripped []byte, removed 
 			return "", b, false
 		}
 		ve := dec.InputOffset()
-		if keyStr == "_project" && foundIdx < 0 {
-			keyStart, valEnd = ks, ve
-			foundIdx = idx
+		if keyStr == "_project" {
+			hits = append(hits, span{keyStart: ks, valEnd: ve, idx: idx})
+			// Last-wins for the project name, matching json.Unmarshal.
 			var pv string
 			if err := json.Unmarshal(raw, &pv); err == nil {
 				project = pv
 			}
-			// Don't break — we need the total sibling count for the
-			// comma-handling branch below, and a duplicate key (rare,
-			// non-canonical) shouldn't confuse the splice.
 		}
 		idx++
 	}
-	if foundIdx < 0 {
+	if len(hits) == 0 {
 		return "", b, false
 	}
-	siblings := idx - 1
-	if siblings == 0 {
+	total := idx
+	if int64(len(hits)) == total {
+		// All members were `_project`. Result is the empty object.
 		return project, []byte("{}"), true
 	}
-	out := make([]byte, 0, len(b))
-	if foundIdx == 0 {
-		out = append(out, b[:keyStart]...)
-		i := int(valEnd)
-		for i < len(b) && isJSONSpace(b[i]) {
-			i++
+
+	// Splice out each hit, extending the cut to absorb exactly one
+	// separating comma per removed member so the surviving object stays
+	// well-formed. Whether to swallow the leading or trailing comma
+	// depends on position: a first-position member owns the comma after
+	// its value; any other position owns the comma before its key.
+	type cut struct{ start, end int }
+	cuts := make([]cut, 0, len(hits))
+	for _, h := range hits {
+		if h.idx == 0 {
+			end := int(h.valEnd)
+			for end < len(b) && isJSONSpace(b[end]) {
+				end++
+			}
+			if end < len(b) && b[end] == ',' {
+				end++
+			}
+			cuts = append(cuts, cut{start: int(h.keyStart), end: end})
+		} else {
+			start := int(h.keyStart)
+			for start > 0 && isJSONSpace(b[start-1]) {
+				start--
+			}
+			if start > 0 && b[start-1] == ',' {
+				start--
+			}
+			cuts = append(cuts, cut{start: start, end: int(h.valEnd)})
 		}
-		if i < len(b) && b[i] == ',' {
-			i++
-		}
-		out = append(out, b[i:]...)
-	} else {
-		i := int(keyStart)
-		for i > 0 && isJSONSpace(b[i-1]) {
-			i--
-		}
-		if i > 0 && b[i-1] == ',' {
-			i--
-		}
-		out = append(out, b[:i]...)
-		out = append(out, b[valEnd:]...)
 	}
+
+	out := make([]byte, 0, len(b))
+	pos := 0
+	for _, c := range cuts {
+		if c.start > pos {
+			out = append(out, b[pos:c.start]...)
+		}
+		pos = c.end
+	}
+	out = append(out, b[pos:]...)
 	return project, out, true
 }
 

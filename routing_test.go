@@ -73,6 +73,31 @@ func TestExtractAndStripProject_OnlyField(t *testing.T) {
 	}
 }
 
+func TestExtractAndStripProject_DuplicateKeysStripAllLastWins(t *testing.T) {
+	// Duplicate top-level keys are non-canonical JSON but legal under
+	// RFC 8259. Strip every occurrence (the gateway uses
+	// DisallowUnknownFields and would 400 on any leak) and adopt the
+	// last value for routing, matching json.Unmarshal semantics.
+	in := []byte(`{"_project":"first","a":1,"_project":"middle","b":2,"_project":"last"}`)
+	proj, out, removed := extractAndStripProject(in)
+	if !removed || proj != "last" {
+		t.Fatalf("got proj=%q removed=%v", proj, removed)
+	}
+	if !json.Valid(out) {
+		t.Fatalf("output not valid JSON: %s", out)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := m["_project"]; found {
+		t.Errorf("_project not fully stripped: %s", out)
+	}
+	if m["a"] == nil || m["b"] == nil {
+		t.Errorf("siblings lost: %s", out)
+	}
+}
+
 func TestExtractAndStripProject_NotObject(t *testing.T) {
 	for _, c := range []string{`[]`, `123`, ``, `null`} {
 		_, _, removed := extractAndStripProject([]byte(c))
