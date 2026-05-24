@@ -514,9 +514,12 @@ func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
 	// Stamp project so the demuxer can route without re-parsing. May be ""
 	// when routing to DefaultProject — lookup() handles that case.
 	dg.project = project
+	// Manual RUnlock (no defer) — this is the listener's hot path; the
+	// defer overhead is measurable here and the function is small enough
+	// that the early returns below are easy to audit by eye.
 	r.sharedSendMu.RLock()
-	defer r.sharedSendMu.RUnlock()
 	if r.sharedClosed {
+		r.sharedSendMu.RUnlock()
 		// Shutdown in progress; account as routing_closed for the
 		// destination pipeline so this drop is attributable. Not
 		// queueFull (the queue may have had capacity; the agent is
@@ -527,8 +530,10 @@ func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
 	}
 	select {
 	case r.sharedRawCh <- dg:
+		r.sharedSendMu.RUnlock()
 		return true, false
 	default:
+		r.sharedSendMu.RUnlock()
 		return false, true
 	}
 }

@@ -16,13 +16,18 @@ All notable changes to this project are documented here.
 - **BREAKING:** `MESH0_QUEUE_SIZE` reverts to **process-wide** with a
   single shared queue feeding a demuxer that fans datagrams out to
   per-project pipelines. Each pipeline now owns only a small 16-slot
-  handoff buffer. Worst-case in-flight memory is `QUEUE_SIZE ×
-  MESH0_MAX_EVENT_BYTES` (independent of the number of registered
-  projects), so the same `QUEUE_SIZE` setting now matches one fixed
-  memory budget rather than scaling with project count. The trade-off:
-  a single project that monopolises the shared queue can back-pressure
-  the others — fine for related projects under one customer, not fine
-  for hostile-tenant isolation (run separate agents for that).
+  handoff buffer. The shared queue's worst-case in-flight memory is
+  `QUEUE_SIZE × MESH0_MAX_EVENT_BYTES`, independent of project count;
+  the handoff buffers add `16 × registered_projects ×
+  MESH0_MAX_EVENT_BYTES` on top, which is dominated by the shared
+  queue at modest project counts but grows linearly with
+  `MESH0_MAX_PROJECTS` (at the 4096 cap, lower `MESH0_MAX_EVENT_BYTES`
+  to keep the handoff contribution bounded). The same `QUEUE_SIZE`
+  setting now matches one fixed shared-queue budget rather than
+  scaling with project count. The trade-off: a single project that
+  monopolises the shared queue can back-pressure the others — fine for
+  related projects under one customer, not fine for hostile-tenant
+  isolation (run separate agents for that).
 - Per-project `events_dropped.queue_full` (visible in `by_project`)
   now means a specific project's 16-slot handoff buffer overflowed,
   not the shared queue. Process-wide `events_dropped.queue_full`

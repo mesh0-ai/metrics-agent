@@ -7,6 +7,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -1029,5 +1031,134 @@ func TestRegistry_DispatchClosedPipelineAccountsRoutingClosed(t *testing.T) {
 	}
 	if p.stats.DropsRoutingClosed.Load() != 1 {
 		t.Errorf("per-pipeline routing_closed: got %d want 1", p.stats.DropsRoutingClosed.Load())
+	}
+}
+
+// TestRegistry_PerPipelineHandoffFullBumpsOnlyPerProjectQueueFull pins the
+// semantic the PR's CHANGELOG flags as breaking: when a single project's
+// 16-slot handoff buffer overflows while the shared queue still has
+// capacity, the per-project `queue_full` counter must bump and the
+// process-wide `queue_full` counter must NOT. Operators rely on this
+// distinction to tell "the whole agent is back-pressured" from "one
+// project's batcher/flusher is wedged."
+func TestRegistry_PerPipelineHandoffFullBumpsOnlyPerProjectQueueFull(t *testing.T) {
+	// Wedge the gateway so the flusher never makes forward progress. With
+	// MaxBatch=1 every dispatched event becomes its own batch, so after
+	// (batchCh cap=8 + 1 in-flight POST) events the batcher blocks trying
+	// to hand off; subsequent events fill the 16-slot rawCh; the next
+	// demux trySend then returns full.
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	// LIFO defer order: shutdown(0) cancels in-flight POSTs → close(release)
+	// unblocks any handler still waiting → srv.Close() can then complete
+	// without timing out on a stuck client connection.
+	defer srv.Close()
+	defer func() { close(release) }()
+
+	cfg := testConfig()
+	cfg.APIKey = "m0_default"
+	cfg.GatewayURL = srv.URL
+	cfg.MaxBatch = 1
+	cfg.BatchWindow = 1 * time.Millisecond
+	// Generous shared queue so it never fills during the test.
+	cfg.QueueSize = 1024
+	stats := newSelfStats()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg := newRegistry(cfg, log, stats)
+	if err := reg.install(); err != nil {
+		t.Fatal(err)
+	}
+	defer reg.shutdown(0)
+
+	p, _ := reg.lookup("")
+
+	// Drip-feed datagrams one at a time with a small pause so the demuxer
+	// always drains shared before the next dispatch lands. After the
+	// pipeline wedges, additional dispatches will hit the per-pipeline
+	// trySend default branch in the demuxer.
+	//
+	// Bound: batchCh(8) + flusher in-flight(1) + rawCh(16) = 25 events
+	// before further sends start overflowing the handoff. Send 100 to
+	// guarantee plenty of overflow signals without depending on tight
+	// scheduler timing.
+	body := []byte(`{"a":1}`)
+	for i := 0; i < 100; i++ {
+		ok, qfull := reg.dispatch(rawDatagram{bytes: body, at: time.Now()})
+		if qfull {
+			t.Fatalf("dispatch %d reported shared-queue full; QueueSize=%d is too small for this test", i, cfg.QueueSize)
+		}
+		_ = ok // dispatch returns false-with-qfull=false is impossible here (dg is routable)
+		time.Sleep(200 * time.Microsecond)
+	}
+
+	// Poll for per-project queue_full > 0. The exact count depends on
+	// scheduler interleavings between dispatch and demux, so we only
+	// assert "at least one overflow was observed."
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if p.stats.DropsQueueFull.Load() > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := p.stats.DropsQueueFull.Load(); got == 0 {
+		t.Fatal("per-project DropsQueueFull never bumped — handoff buffer overflow not exercised")
+	}
+	if got := stats.DropsQueueFull.Load(); got != 0 {
+		t.Errorf("process-wide DropsQueueFull bumped (%d) but shared queue had capacity — semantic regression: per-pipeline overflow must not count toward process-wide queue_full", got)
+	}
+}
+
+// TestRegistry_DemuxAccountsRoutingClosedForUnknownProject pins the
+// dispatch→reload→demux race: a datagram that was successfully routed at
+// dispatch time can find its destination pipeline gone by the time the
+// demuxer pops it (a SIGHUP reload removed the project in between). The
+// demuxer's lookup-miss branch must account this as routing_closed
+// rather than silently swallowing it. The test models the race by
+// injecting a datagram whose `project` field names a project not in the
+// current routing table directly into the shared queue — bypassing
+// dispatch (which would reject the unknown project as
+// unrouted_unknown).
+func TestRegistry_DemuxAccountsRoutingClosedForUnknownProject(t *testing.T) {
+	cfg := testConfig()
+	cfg.APIKey = "m0_default"
+	stats := newSelfStats()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg := newRegistry(cfg, log, stats)
+	if err := reg.install(); err != nil {
+		t.Fatal(err)
+	}
+	defer reg.shutdown(0)
+
+	// Inject a datagram pre-stamped with a project name that the current
+	// routing table does not contain. This is exactly the state the
+	// demuxer would observe if dispatch had stamped `project="ws-gone"`
+	// against an older routing table snapshot and reload subsequently
+	// retired the project.
+	reg.sharedRawCh <- rawDatagram{bytes: []byte(`{"a":1}`), at: time.Now(), project: "ws-gone"}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if stats.DropsRoutingClosed.Load() == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := stats.DropsRoutingClosed.Load(); got != 1 {
+		t.Fatalf("process-wide DropsRoutingClosed: got %d want 1 (demuxer missed the lookup-miss branch)", got)
+	}
+	// Default pipeline must not be charged — the datagram never named it.
+	p, _ := reg.lookup("")
+	if got := p.stats.DropsRoutingClosed.Load(); got != 0 {
+		t.Errorf("default pipeline DropsRoutingClosed: got %d want 0 (lookup miss must not charge an unrelated pipeline)", got)
+	}
+	// And no other drop category should fire for a lookup miss.
+	if got := stats.DropsQueueFull.Load(); got != 0 {
+		t.Errorf("DropsQueueFull: got %d want 0", got)
+	}
+	if got := stats.DropsUnroutedUnknown.Load(); got != 0 {
+		t.Errorf("DropsUnroutedUnknown: got %d want 0 (demuxer lookup miss is routing_closed, not unrouted)", got)
 	}
 }
