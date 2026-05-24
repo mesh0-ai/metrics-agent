@@ -44,6 +44,33 @@ All notable changes to this project are documented here.
   now accounted as `events_dropped.parse_error` at the routing layer
   instead of being forwarded verbatim (which would 4xx the whole batch
   at the gateway).
+- A datagram whose `_project` value is well-formed JSON but **not a
+  string** (number, null, object, array) is now accounted as
+  `events_dropped.unrouted_unknown_project` instead of silently
+  defaulting to the `MESH0_API_KEY` fallback. Catches misbehaving
+  client SDKs that would otherwise cross-attribute to whichever tenant
+  owns the default key.
+- New env var `MESH0_MAX_PROJECTS` (default `64`, range `[1, 4096]`)
+  caps the number of registered pipelines. Each pipeline costs
+  `QueueSize × MaxEventBytes` of worst-case in-flight memory plus two
+  goroutines and an `http.Client`; a misconfigured keys file with one
+  entry per request-id would otherwise OOM the 32Mi sidecar. `install`
+  fails fast over the cap; `SIGHUP` reload over the cap is rejected and
+  bumps `keys_reload_failures` (previous table is kept).
+- New env var `MESH0_REQUIRE_PROJECT` (default `false`). When set, the
+  `MESH0_API_KEY` fallback is disabled for datagrams arriving without a
+  `_project` field — they drop as `unrouted_missing_project` instead.
+  Recommended for multi-tenant deployments to surface mis-tagged
+  callers rather than silently cross-attributing them.
+- New drop counter `events_dropped.routing_closed` (per-project and
+  process-wide). Distinguishes "a SIGHUP reload retired this pipeline
+  between lookup and send" from genuine queue saturation, so a
+  `queue_full` alert isn't triggered by reload churn.
+- `MESH0_KEYS_FILE` is now opened with `O_NOFOLLOW` and rejected if it
+  is a symlink, a non-regular file, world-writable, or larger than
+  1 MiB. Operators should keep it mode `0600` (or `0640`); a writable
+  keys file is effectively a root credential for every registered
+  tenant.
 
 - Per-datagram size cap is now configurable via `MESH0_MAX_EVENT_BYTES`,
   with a new default of **1 MB** (was a hard-coded 32 KB). Range

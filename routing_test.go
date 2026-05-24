@@ -14,7 +14,7 @@ import (
 
 func TestExtractAndStripProject_NoField(t *testing.T) {
 	in := []byte(`{"a":1,"b":"hi"}`)
-	proj, out, removed, malformed := extractAndStripProject(in)
+	proj, out, removed, malformed, _ := extractAndStripProject(in)
 	if removed || malformed {
 		t.Errorf("removed=%v malformed=%v, expected both false", removed, malformed)
 	}
@@ -28,7 +28,7 @@ func TestExtractAndStripProject_NoField(t *testing.T) {
 
 func TestExtractAndStripProject_FirstField(t *testing.T) {
 	in := []byte(`{"_project":"ws-42","a":1,"b":"hi"}`)
-	proj, out, removed, malformed := extractAndStripProject(in)
+	proj, out, removed, malformed, _ := extractAndStripProject(in)
 	if !removed || malformed || proj != "ws-42" {
 		t.Fatalf("got proj=%q removed=%v malformed=%v", proj, removed, malformed)
 	}
@@ -49,7 +49,7 @@ func TestExtractAndStripProject_FirstField(t *testing.T) {
 
 func TestExtractAndStripProject_MiddleField(t *testing.T) {
 	in := []byte(`{"a":1,"_project":"ws-99","b":"hi"}`)
-	proj, out, removed, malformed := extractAndStripProject(in)
+	proj, out, removed, malformed, _ := extractAndStripProject(in)
 	if !removed || malformed || proj != "ws-99" {
 		t.Fatalf("got proj=%q removed=%v malformed=%v", proj, removed, malformed)
 	}
@@ -64,7 +64,7 @@ func TestExtractAndStripProject_MiddleField(t *testing.T) {
 
 func TestExtractAndStripProject_OnlyField(t *testing.T) {
 	in := []byte(`{"_project":"solo"}`)
-	proj, out, removed, malformed := extractAndStripProject(in)
+	proj, out, removed, malformed, _ := extractAndStripProject(in)
 	if !removed || malformed || proj != "solo" {
 		t.Fatalf("got proj=%q removed=%v malformed=%v", proj, removed, malformed)
 	}
@@ -79,7 +79,7 @@ func TestExtractAndStripProject_DuplicateKeysStripAllLastWins(t *testing.T) {
 	// DisallowUnknownFields and would 400 on any leak) and adopt the
 	// last value for routing, matching json.Unmarshal semantics.
 	in := []byte(`{"_project":"first","a":1,"_project":"middle","b":2,"_project":"last"}`)
-	proj, out, removed, malformed := extractAndStripProject(in)
+	proj, out, removed, malformed, _ := extractAndStripProject(in)
 	if !removed || malformed || proj != "last" {
 		t.Fatalf("got proj=%q removed=%v malformed=%v", proj, removed, malformed)
 	}
@@ -103,7 +103,7 @@ func TestExtractAndStripProject_NotObject(t *testing.T) {
 	// layer's job to drop — the validator will reject it as parse_error.
 	// We just confirm we don't claim to have stripped anything.
 	for _, c := range []string{`[]`, `123`, `null`} {
-		_, _, removed, _ := extractAndStripProject([]byte(c))
+		_, _, removed, _, _ := extractAndStripProject([]byte(c))
 		if removed {
 			t.Errorf("removed=true for %q", c)
 		}
@@ -117,7 +117,7 @@ func TestExtractAndStripProject_NotObject(t *testing.T) {
 // test pins it so a future "fast path" rewrite can't silently break.
 func TestExtractAndStripProject_LiteralInsideString(t *testing.T) {
 	in := []byte(`{"msg":"this string contains \"_project\" verbatim","real":1}`)
-	proj, out, removed, malformed := extractAndStripProject(in)
+	proj, out, removed, malformed, _ := extractAndStripProject(in)
 	if removed || malformed {
 		t.Fatalf("got proj=%q removed=%v malformed=%v; expected pass-through", proj, removed, malformed)
 	}
@@ -131,7 +131,7 @@ func TestExtractAndStripProject_LiteralInsideString(t *testing.T) {
 // as a routing hint.
 func TestExtractAndStripProject_LiteralInsideNestedKey(t *testing.T) {
 	in := []byte(`{"meta":{"_project":"nested"},"a":1}`)
-	proj, out, removed, malformed := extractAndStripProject(in)
+	proj, out, removed, malformed, _ := extractAndStripProject(in)
 	if removed || malformed || proj != "" {
 		t.Fatalf("got proj=%q removed=%v malformed=%v; expected pass-through", proj, removed, malformed)
 	}
@@ -141,18 +141,22 @@ func TestExtractAndStripProject_LiteralInsideNestedKey(t *testing.T) {
 }
 
 // TestExtractAndStripProject_NonStringValue: `_project` with a non-string
-// value (number, null, object) is malformed-ish — we still strip the key
-// (so the gateway doesn't 400) but the project name stays empty, which
-// will route to default or missing depending on registration.
+// value (number, null, object) is well-formed JSON but unusable for routing.
+// The key is still stripped (so the gateway doesn't 400) and badProject=true
+// so dispatch counts it as unrouted_unknown instead of silently falling
+// through to the DefaultProject pipeline.
 func TestExtractAndStripProject_NonStringValue(t *testing.T) {
 	for _, body := range []string{
 		`{"_project":42,"a":1}`,
 		`{"_project":null,"a":1}`,
 		`{"_project":{"nested":"obj"},"a":1}`,
 	} {
-		proj, out, removed, malformed := extractAndStripProject([]byte(body))
+		proj, out, removed, malformed, badProject := extractAndStripProject([]byte(body))
 		if malformed {
 			t.Errorf("%s: malformed=true, expected false (well-formed JSON)", body)
+		}
+		if !badProject {
+			t.Errorf("%s: badProject=false, expected true (non-string _project)", body)
 		}
 		if !removed {
 			t.Errorf("%s: removed=false, expected true (key still stripped)", body)
@@ -166,11 +170,34 @@ func TestExtractAndStripProject_NonStringValue(t *testing.T) {
 	}
 }
 
+// TestExtractAndStripProject_NonStringThenStringLastWins: mixed-type
+// duplicates — non-string occurrence earlier, string occurrence last. The
+// last (string) wins per json.Unmarshal semantics; badProject must clear.
+func TestExtractAndStripProject_NonStringThenStringLastWins(t *testing.T) {
+	in := []byte(`{"_project":42,"a":1,"_project":"good"}`)
+	proj, _, removed, malformed, badProject := extractAndStripProject(in)
+	if malformed || !removed || badProject || proj != "good" {
+		t.Fatalf("got proj=%q removed=%v malformed=%v badProject=%v", proj, removed, malformed, badProject)
+	}
+}
+
+// TestExtractAndStripProject_StringThenNonStringLastWins: string first,
+// non-string last — last-wins means badProject must be set and project
+// cleared, so the dispatcher accounts the drop rather than misrouting to
+// the earlier string value.
+func TestExtractAndStripProject_StringThenNonStringLastWins(t *testing.T) {
+	in := []byte(`{"_project":"good","a":1,"_project":42}`)
+	proj, _, removed, malformed, badProject := extractAndStripProject(in)
+	if malformed || !removed || !badProject || proj != "" {
+		t.Fatalf("got proj=%q removed=%v malformed=%v badProject=%v", proj, removed, malformed, badProject)
+	}
+}
+
 // TestExtractAndStripProject_Whitespace: pretty-printed input with
 // inter-token whitespace must still produce a well-formed output.
 func TestExtractAndStripProject_Whitespace(t *testing.T) {
 	in := []byte("{ \"a\":1, \"_project\" : \"ws-42\" , \"b\":2 }")
-	proj, out, removed, malformed := extractAndStripProject(in)
+	proj, out, removed, malformed, _ := extractAndStripProject(in)
 	if !removed || malformed || proj != "ws-42" {
 		t.Fatalf("got proj=%q removed=%v malformed=%v", proj, removed, malformed)
 	}
@@ -194,7 +221,7 @@ func TestExtractAndStripProject_Malformed(t *testing.T) {
 		`{"_project":"x",`,       // truncated
 		`{"_project":"x", trail`, // garbage after value
 	} {
-		_, _, _, malformed := extractAndStripProject([]byte(body))
+		_, _, _, malformed, _ := extractAndStripProject([]byte(body))
 		if !malformed {
 			t.Errorf("%q: malformed=false, expected true", body)
 		}
@@ -691,7 +718,7 @@ func BenchmarkExtractAndStripProject_NoField(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _, _, _ = extractAndStripProject(in)
+		_, _, _, _, _ = extractAndStripProject(in)
 	}
 }
 
@@ -700,7 +727,7 @@ func BenchmarkExtractAndStripProject_FirstField(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _, _, _ = extractAndStripProject(in)
+		_, _, _, _, _ = extractAndStripProject(in)
 	}
 }
 
@@ -729,5 +756,136 @@ func testConfig() Config {
 		QueueSize:     16,
 		MaxRetries:    0,
 		ShutdownGrace: 0,
+	}
+}
+
+func TestLoadKeysFile_RejectsWorldWritable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keys.json")
+	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Chmod explicitly; os.WriteFile honors umask so 0o666 → 0o644 on most
+	// developer machines and we'd miss the rejection branch.
+	if err := os.Chmod(path, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadKeysFile(path); err == nil {
+		t.Fatal("expected error for world-writable keys file")
+	}
+}
+
+func TestLoadKeysFile_RejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real.json")
+	link := filepath.Join(dir, "keys.json")
+	if err := os.WriteFile(real, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	if _, err := loadKeysFile(link); err == nil {
+		t.Fatal("expected error for symlinked keys file")
+	}
+}
+
+func TestInstall_RejectsTooManyProjects(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keys.json")
+	keys := map[string]string{"a": "k1", "b": "k2", "c": "k3"}
+	body, _ := json.Marshal(keys)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig()
+	cfg.APIKey = ""
+	cfg.KeysFile = path
+	cfg.MaxProjects = 2
+	reg := newRegistry(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), newSelfStats())
+	if err := reg.install(); err == nil {
+		t.Fatal("expected install to reject 3 projects with MaxProjects=2")
+	}
+}
+
+func TestRegistry_RequireProjectDisablesDefaultFallback(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keys.json")
+	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig()
+	cfg.APIKey = "m0_default" // would normally absorb unlabeled datagrams
+	cfg.KeysFile = path
+	cfg.RequireProject = true
+	stats := newSelfStats()
+	reg := newRegistry(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), stats)
+	if err := reg.install(); err != nil {
+		t.Fatal(err)
+	}
+	defer reg.shutdown(0)
+
+	// No _project on the wire — with RequireProject set this must NOT route
+	// to the _default pipeline; it must drop as unrouted_missing.
+	reg.dispatch(rawDatagram{bytes: []byte(`{"a":1}`), at: time.Now()})
+	if stats.DropsUnroutedMissing.Load() != 1 {
+		t.Errorf("missing: got %d", stats.DropsUnroutedMissing.Load())
+	}
+}
+
+func TestRegistry_DispatchBadProjectType(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keys.json")
+	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig()
+	cfg.APIKey = "m0_default" // default exists; non-string _project must
+	// still NOT fall through to it (silent cross-tenant attribution).
+	cfg.KeysFile = path
+	stats := newSelfStats()
+	reg := newRegistry(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), stats)
+	if err := reg.install(); err != nil {
+		t.Fatal(err)
+	}
+	defer reg.shutdown(0)
+
+	reg.dispatch(rawDatagram{bytes: []byte(`{"_project":42,"a":1}`), at: time.Now()})
+	if stats.DropsUnroutedUnknown.Load() != 1 {
+		t.Errorf("unknown: got %d want 1", stats.DropsUnroutedUnknown.Load())
+	}
+	// Default pipeline must NOT have received it.
+	defPipe, _ := reg.lookup("")
+	if defPipe != nil && defPipe.stats.EventsReceived.Load() != 0 {
+		t.Errorf("non-string _project leaked into default pipeline: %d", defPipe.stats.EventsReceived.Load())
+	}
+}
+
+func TestRegistry_DispatchClosedPipelineAccountsRoutingClosed(t *testing.T) {
+	cfg := testConfig()
+	cfg.APIKey = "m0_default"
+	stats := newSelfStats()
+	reg := newRegistry(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), stats)
+	if err := reg.install(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-drain the default pipeline, then dispatch. trySend must report
+	// closed; dispatch must account it as routing_closed (not queue_full).
+	p, _ := reg.lookup("")
+	p.drain(0)
+
+	_, queueFull := reg.dispatch(rawDatagram{bytes: []byte(`{"a":1}`), at: time.Now()})
+	if queueFull {
+		t.Error("dispatch reported queueFull on a closed pipeline; should be routing_closed")
+	}
+	if stats.DropsRoutingClosed.Load() != 1 {
+		t.Errorf("DropsRoutingClosed: got %d want 1", stats.DropsRoutingClosed.Load())
+	}
+	if stats.DropsQueueFull.Load() != 0 {
+		t.Errorf("DropsQueueFull: got %d want 0 (closed pipeline must not bump queue_full)", stats.DropsQueueFull.Load())
+	}
+	if p.stats.DropsRoutingClosed.Load() != 1 {
+		t.Errorf("per-pipeline routing_closed: got %d want 1", p.stats.DropsRoutingClosed.Load())
 	}
 }

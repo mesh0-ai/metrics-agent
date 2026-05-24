@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -55,21 +57,23 @@ type pipeline struct {
 	closed bool
 }
 
-// trySend delivers dg to the pipeline's input queue without blocking. The
-// closed return is true when the pipeline has already been drained — the
-// caller should account this as queue_full (capacity ran out before the
-// drain ordering caught up) rather than panic.
-func (p *pipeline) trySend(dg rawDatagram) (delivered, queueFull bool) {
+// trySend delivers dg to the pipeline's input queue without blocking. At
+// most one of (closed, queueFull) is true on a non-delivered send:
+//   - closed=true means the pipeline has been drained (SIGHUP reload retired
+//     it, or shutdown is in progress). Caller accounts as drops.routing_closed
+//     — not queue_full, since the queue may have had capacity.
+//   - queueFull=true means the queue rejected the send under back-pressure.
+func (p *pipeline) trySend(dg rawDatagram) (delivered, closed, queueFull bool) {
 	p.sendMu.RLock()
 	defer p.sendMu.RUnlock()
 	if p.closed {
-		return false, true
+		return false, true, false
 	}
 	select {
 	case p.rawCh <- dg:
-		return true, false
+		return true, false, false
 	default:
-		return false, true
+		return false, false, true
 	}
 }
 
@@ -205,6 +209,9 @@ func (r *registry) install() error {
 	if len(keys) == 0 {
 		return errors.New("no API keys configured (set MESH0_API_KEY or MESH0_KEYS_FILE)")
 	}
+	if r.cfg.MaxProjects > 0 && len(keys) > r.cfg.MaxProjects {
+		return fmt.Errorf("registered projects (%d) exceed MESH0_MAX_PROJECTS (%d); each pipeline costs ~QueueSize*MaxEventBytes of in-flight memory", len(keys), r.cfg.MaxProjects)
+	}
 	tbl := r.buildTable(keys, nil)
 	// Start pipelines BEFORE publishing the table so dispatch can never
 	// land a datagram on a pipeline whose goroutines aren't running yet.
@@ -256,6 +263,13 @@ func (r *registry) reload() {
 	}
 	for k, v := range fileKeys {
 		newKeys[k] = v
+	}
+
+	if r.cfg.MaxProjects > 0 && len(newKeys) > r.cfg.MaxProjects {
+		r.KeysReloadFailures.Add(1)
+		r.log.Error("keys file reload rejected: too many projects, keeping previous table",
+			"count", len(newKeys), "max_projects", r.cfg.MaxProjects)
+		return
 	}
 
 	prev := r.cur.Load()
@@ -323,7 +337,11 @@ func (r *registry) lookup(project string) (*pipeline, bool) {
 		return nil, false
 	}
 	if project == "" {
-		if t.hasDefault {
+		// RequireProject disables the DefaultProject fallback so multi-tenant
+		// deployments can surface mis-tagged callers via unrouted_missing
+		// rather than silently cross-attributing them to whichever tenant
+		// owns MESH0_API_KEY.
+		if t.hasDefault && !r.cfg.RequireProject {
 			return t.pipelines[DefaultProject], true
 		}
 		return nil, false
@@ -336,14 +354,31 @@ func (r *registry) lookup(project string) (*pipeline, bool) {
 // pipeline based on the `_project` field; strips `_project` so the gateway
 // sees the original CustomEventInput shape. The listener has already bumped
 // the process-wide EventsReceived counter; per-project EventsReceived is
-// bumped by the batcher after validation. Drops route to
-// DropsUnrouted{Missing,Unknown} (process-wide) for routing-layer drops,
-// and per-pipeline DropsQueueFull for saturation (the listener also bumps
-// the process-wide DropsQueueFull when we return queueFull=true).
+// bumped by the batcher after validation. Drops route to:
+//   - DropsParseError (process-wide) when the routing-strip pass finds the
+//     payload is not a JSON object.
+//   - DropsUnrouted{Missing,Unknown} (process-wide) for routing-layer drops,
+//     including non-string `_project` values (treated as unknown — the JSON
+//     is well-formed but unusable for routing).
+//   - DropsQueueFull (per-pipeline and process-wide) for queue saturation.
+//   - DropsRoutingClosed (per-pipeline and process-wide) when the destination
+//     pipeline was drained between lookup and send (SIGHUP reload race).
+//
+// The listener also bumps process-wide DropsQueueFull when we return
+// queueFull=true. Closed-pipeline drops do NOT signal queueFull — they
+// would mis-attribute reload churn to back-pressure.
 func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
-	project, stripped, removed, malformed := extractAndStripProject(dg.bytes)
+	project, stripped, removed, malformed, badProject := extractAndStripProject(dg.bytes)
 	if malformed {
 		r.processStats.DropsParseError.Add(1)
+		return false, false
+	}
+	if badProject {
+		// `_project` was present but not a JSON string. JSON is structurally
+		// valid; the routing intent is unusable. Account as unrouted_unknown
+		// so an alert on that counter catches malformed client SDKs without
+		// conflating with broken-JSON parse_error.
+		r.processStats.DropsUnroutedUnknown.Add(1)
 		return false, false
 	}
 	if removed {
@@ -358,11 +393,15 @@ func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
 		}
 		return false, false
 	}
-	delivered, full := p.trySend(dg)
-	if delivered {
+	delivered, closed, full := p.trySend(dg)
+	switch {
+	case delivered:
 		return true, false
-	}
-	if full {
+	case closed:
+		p.stats.DropsRoutingClosed.Add(1)
+		r.processStats.DropsRoutingClosed.Add(1)
+		return false, false
+	case full:
 		p.stats.DropsQueueFull.Add(1)
 		return false, true
 	}
@@ -403,13 +442,48 @@ func (r *registry) snapshot() map[string]projectStatsSnapshot {
 	return out
 }
 
+// keysFileMaxBytes caps the keys file read so a runaway-large file (or an
+// attacker-substituted /dev/zero symlink target, if O_NOFOLLOW were missing)
+// cannot exhaust process memory on SIGHUP. 1 MiB comfortably fits ~4000
+// project entries at typical key/name sizes.
+const keysFileMaxBytes = 1 << 20
+
 // loadKeysFile reads a JSON object mapping project name → API key. Project
 // names must be non-empty and may not start with `_` (reserved for sentinels
 // like DefaultProject). API keys must be non-empty strings.
+//
+// The file is opened with O_NOFOLLOW so an attacker who can replace the
+// configured path with a symlink cannot redirect us to read arbitrary files.
+// World-writable files are rejected (a writable keys file is effectively a
+// per-process root credential for every registered tenant — operators should
+// keep it 0600 or 0640). The read is capped at keysFileMaxBytes.
 func loadKeysFile(path string) (map[string]string, error) {
-	b, err := os.ReadFile(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		// ELOOP from O_NOFOLLOW surfaces as a "too many levels of symbolic
+		// links" syscall error; wrap to make the security context explicit.
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, fmt.Errorf("keys file %q is a symlink (refusing for safety)", path)
+		}
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
 	if err != nil {
 		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("keys file %q is not a regular file", path)
+	}
+	if fi.Mode().Perm()&0o002 != 0 {
+		return nil, fmt.Errorf("keys file %q is world-writable (perm %#o); chmod 0600 it", path, fi.Mode().Perm())
+	}
+	b, err := io.ReadAll(io.LimitReader(f, keysFileMaxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > keysFileMaxBytes {
+		return nil, fmt.Errorf("keys file %q exceeds %d bytes", path, keysFileMaxBytes)
 	}
 	var raw map[string]string
 	dec := json.NewDecoder(bytes.NewReader(b))
@@ -438,7 +512,7 @@ func loadKeysFile(path string) (map[string]string, error) {
 var projectKeyMarker = []byte(`"_project"`)
 
 // extractAndStripProject pulls `_project` out of a top-level JSON object and
-// returns (project, bytes-without-_project, removed, malformed).
+// returns (project, bytes-without-_project, removed, malformed, badProject).
 //
 //   - removed=true means at least one `_project` member was stripped and
 //     `stripped` is the rewritten body.
@@ -446,8 +520,13 @@ var projectKeyMarker = []byte(`"_project"`)
 //     (or has a non-string key, or a value the decoder couldn't consume).
 //     The caller MUST account this as a parse_error and drop — the original
 //     bytes would 400 against the gateway and poison the batch.
-//   - removed=false, malformed=false means the input is a JSON object with
-//     no `_project` (the common case).
+//   - badProject=true means at least one `_project` member was present but
+//     its LAST occurrence is not a JSON string (e.g. number, null, object).
+//     The body is still well-formed JSON; routing is unusable. Caller
+//     accounts as unrouted_unknown so a misbehaving client SDK doesn't get
+//     silently routed to the DefaultProject fallback.
+//   - removed=false, malformed=false, badProject=false means the input is a
+//     JSON object with no `_project` (the common case).
 //
 // All occurrences of `_project` are stripped (duplicate top-level keys are
 // non-canonical JSON, but leaking even one through would 400 against the
@@ -457,21 +536,21 @@ var projectKeyMarker = []byte(`"_project"`)
 // The strip path uses json.Decoder.InputOffset to slice the key+value
 // ranges out, avoiding an unmarshal + remarshal round-trip on the hot
 // path. Order of remaining fields is preserved.
-func extractAndStripProject(b []byte) (project string, stripped []byte, removed, malformed bool) {
+func extractAndStripProject(b []byte) (project string, stripped []byte, removed, malformed, badProject bool) {
 	// Hot-path prefilter: most datagrams in single-tenant deployments don't
 	// carry the field. Avoid allocating a json.Decoder for them.
 	if !bytes.Contains(b, projectKeyMarker) {
-		return "", b, false, false
+		return "", b, false, false, false
 	}
 	dec := json.NewDecoder(bytes.NewReader(b))
 	tok, err := dec.Token()
 	if err != nil {
-		return "", b, false, true
+		return "", b, false, true, false
 	}
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
 		// Not an object — caller's validator will drop with parse_error
 		// regardless, so don't double-count here.
-		return "", b, false, false
+		return "", b, false, false, false
 	}
 
 	type span struct{ keyStart, valEnd, idx int64 }
@@ -482,34 +561,46 @@ func extractAndStripProject(b []byte) (project string, stripped []byte, removed,
 		ks := dec.InputOffset()
 		k, err := dec.Token()
 		if err != nil {
-			return "", b, false, true
+			return "", b, false, true, false
 		}
 		keyStr, ok := k.(string)
 		if !ok {
-			return "", b, false, true
+			return "", b, false, true, false
 		}
 		var raw json.RawMessage
 		if err := dec.Decode(&raw); err != nil {
-			return "", b, false, true
+			return "", b, false, true, false
 		}
 		ve := dec.InputOffset()
 		if keyStr == "_project" {
 			hits = append(hits, span{keyStart: ks, valEnd: ve, idx: idx})
 			// Last-wins for the project name, matching json.Unmarshal.
-			var pv string
-			if err := json.Unmarshal(raw, &pv); err == nil {
-				project = pv
+			// Reset both fields each iteration so a string-typed later
+			// occurrence overrides an earlier non-string one (and vice
+			// versa). Detect string-typed via the first non-space byte
+			// rather than json.Unmarshal: `null` unmarshals into a string
+			// target without error (leaving the zero value), which would
+			// otherwise be indistinguishable from a missing _project.
+			project = ""
+			badProject = true
+			rawTrim := bytes.TrimSpace(raw)
+			if len(rawTrim) > 0 && rawTrim[0] == '"' {
+				var pv string
+				if err := json.Unmarshal(rawTrim, &pv); err == nil {
+					project = pv
+					badProject = false
+				}
 			}
 		}
 		idx++
 	}
 	if len(hits) == 0 {
-		return "", b, false, false
+		return "", b, false, false, false
 	}
 	total := idx
 	if int64(len(hits)) == total {
 		// All members were `_project`. Result is the empty object.
-		return project, []byte("{}"), true, false
+		return project, []byte("{}"), true, false, badProject
 	}
 
 	// Splice out each hit, extending the cut to absorb exactly one
@@ -550,7 +641,7 @@ func extractAndStripProject(b []byte) (project string, stripped []byte, removed,
 		pos = c.end
 	}
 	out = append(out, b[pos:]...)
-	return project, out, true, false
+	return project, out, true, false, badProject
 }
 
 func sortedKeys(m map[string]*pipeline) []string {

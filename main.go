@@ -31,6 +31,18 @@ type Config struct {
 	MaxRetries    int
 	ShutdownGrace time.Duration
 	LogLevel      slog.Level
+	// MaxProjects bounds the number of registered pipelines (including the
+	// MESH0_API_KEY fallback). Each pipeline owns a per-project queue, two
+	// goroutines, and an http.Client — worst-case in-flight memory is
+	// MaxProjects * QueueSize * MaxEventBytes. A misconfigured keys file
+	// (e.g. one entry per request_id) would otherwise OOM the sidecar.
+	MaxProjects int
+	// RequireProject disables the MESH0_API_KEY fallback for datagrams
+	// arriving without a `_project` field. Recommended for multi-tenant
+	// deployments to surface mis-tagged callers as `unrouted_missing_project`
+	// rather than silently cross-attributing to whatever tenant owns the
+	// default key.
+	RequireProject bool
 }
 
 func loadConfig() (Config, error) {
@@ -51,6 +63,7 @@ func loadConfig() (Config, error) {
 		MaxRetries:    4,
 		ShutdownGrace: 15 * time.Second,
 		LogLevel:      slog.LevelInfo,
+		MaxProjects:   64,
 	}
 	if v := os.Getenv("MESH0_BATCH_WINDOW_MS"); v != "" {
 		ms, err := strconv.Atoi(v)
@@ -93,6 +106,23 @@ func loadConfig() (Config, error) {
 			return c, fmt.Errorf("MESH0_SHUTDOWN_GRACE_MS must be a non-negative integer")
 		}
 		c.ShutdownGrace = time.Duration(ms) * time.Millisecond
+	}
+	if v := os.Getenv("MESH0_MAX_PROJECTS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 4096 {
+			return c, fmt.Errorf("MESH0_MAX_PROJECTS must be an integer in [1, 4096]")
+		}
+		c.MaxProjects = n
+	}
+	if v := os.Getenv("MESH0_REQUIRE_PROJECT"); v != "" {
+		switch v {
+		case "1", "true", "TRUE":
+			c.RequireProject = true
+		case "0", "false", "FALSE":
+			c.RequireProject = false
+		default:
+			return c, fmt.Errorf("MESH0_REQUIRE_PROJECT must be 1|0|true|false")
+		}
 	}
 	if v := os.Getenv("MESH0_LOG_LEVEL"); v != "" {
 		switch v {

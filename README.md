@@ -197,6 +197,8 @@ All knobs are environment variables.
 | `MESH0_QUEUE_SIZE`        | `2000`                 | **Per-pipeline** bounded queue depth. Multi-tenant deployments register one pipeline per project, so the process-wide ceiling is `QUEUE_SIZE × registered projects`. Worst-case in-flight memory per pipeline is `QUEUE_SIZE × MESH0_MAX_EVENT_BYTES`. |
 | `MESH0_MAX_RETRIES`       | `4`                    | Retry budget per batch on 429/5xx/network. |
 | `MESH0_SHUTDOWN_GRACE_MS` | `15000`                | Max wait for in-flight flushes on exit.    |
+| `MESH0_MAX_PROJECTS`      | `64`                   | Cap on registered pipelines (incl. `_default`). Range `[1, 4096]`. Each pipeline costs `QUEUE_SIZE × MAX_EVENT_BYTES` of in-flight memory plus two goroutines and an `http.Client`; a misconfigured keys file with one entry per request-id would otherwise OOM the sidecar. `install` fails fast over the cap; `SIGHUP` reload over the cap is rejected and bumps `keys_reload_failures`. |
+| `MESH0_REQUIRE_PROJECT`   | `false`                | When set, datagrams arriving without a `_project` field are **not** routed to the `MESH0_API_KEY` fallback — they drop as `unrouted_missing_project`. Recommended for multi-tenant deployments where silently cross-attributing to the default tenant would be a tagging bug. |
 | `MESH0_LOG_LEVEL`         | `info`                 | `debug` \| `info` \| `warn` \| `error`     |
 
 ## Multi-tenant routing
@@ -229,14 +231,34 @@ table, spawns pipelines for added projects, drains pipelines for removed
 projects, and replaces pipelines whose key rotated. A parse error keeps
 the previous table — a bad reload does not take the agent down.
 
+The keys file is opened with `O_NOFOLLOW` and rejected if it is a symlink,
+a non-regular file, world-writable, or larger than 1 MiB. Keep it
+**mode `0600`** (or `0640` if the agent runs as its own uid) — a writable
+keys file is effectively a root credential for every registered tenant.
+Pin the file count to your scale via `MESH0_MAX_PROJECTS`.
+
+**Key rotation note.** When a project's API key is rotated via SIGHUP,
+the old pipeline drains asynchronously over `MESH0_SHUTDOWN_GRACE_MS`
+(default 15s) using the *old* key for any queued events. For routine
+rotation this is the right tradeoff (don't drop events). For
+**compromised-key** rotation, set `MESH0_SHUTDOWN_GRACE_MS=0` before the
+SIGHUP to cut over immediately at the cost of in-flight batches.
+
+**Tenant identity comes from the `Authorization` header**, not from
+anything in the event body. The agent strips every top-level `_project`
+key before forwarding; the gateway must not read tenant identity from
+the event payload.
+
 Routing rules:
 
 | `_project` present? | Keys configured                          | Behavior |
 |---------------------|------------------------------------------|----------|
 | no                  | one (`MESH0_API_KEY`)                    | route to that key (legacy path)                  |
 | no                  | many (`MESH0_KEYS_FILE` only)            | drop, `drops.unrouted_missing_project`++         |
+| no                  | any, `MESH0_REQUIRE_PROJECT=1`           | drop, `drops.unrouted_missing_project`++         |
 | yes, known          | any                                      | route to matching key                            |
 | yes, unknown        | any                                      | drop, `drops.unrouted_unknown_project`++         |
+| yes, non-string val | any                                      | drop, `drops.unrouted_unknown_project`++         |
 
 Both env vars may be set simultaneously; file routes take precedence and
 `MESH0_API_KEY` is the fallback for datagrams without `_project`. Project
@@ -257,7 +279,7 @@ The agent exposes a small HTTP server on `MESH0_HEALTH_ADDR` (default `:8126`):
   ```json
   {
     "events_received":   123456,
-    "events_dropped":    {"parse_error": 12, "queue_full": 3, "oversize": 0, "flush_failed": 0, "shutdown": 0, "unrouted_missing_project": 0, "unrouted_unknown_project": 0},
+    "events_dropped":    {"parse_error": 12, "queue_full": 3, "oversize": 0, "flush_failed": 0, "shutdown": 0, "routing_closed": 0, "unrouted_missing_project": 0, "unrouted_unknown_project": 0},
     "batches_sent":      247,
     "events_sent":       123087,
     "last_flush_age_ms": 180,
@@ -268,7 +290,7 @@ The agent exposes a small HTTP server on `MESH0_HEALTH_ADDR` (default `:8126`):
     "by_project": {
       "workspace-42": {
         "events_received": 89000, "events_sent": 88950, "batches_sent": 178,
-        "events_dropped":  {"parse_error": 0, "queue_full": 0, "oversize": 0, "flush_failed": 50, "shutdown": 0, "unrouted_missing_project": 0, "unrouted_unknown_project": 0},
+        "events_dropped":  {"parse_error": 0, "queue_full": 0, "oversize": 0, "flush_failed": 50, "shutdown": 0, "routing_closed": 0},
         "last_flush_age_ms": 180
       }
     }
@@ -280,6 +302,10 @@ The agent exposes a small HTTP server on `MESH0_HEALTH_ADDR` (default `:8126`):
     the pipeline finishes draining. `flush_failed` is reserved for true
     gateway failures (retry-exhausted 5xx/429, or non-retryable 4xx) so
     operators can distinguish "gateway broken" from "we shut down."
+  - `events_dropped.routing_closed` counts datagrams that landed on a
+    pipeline retired by a SIGHUP reload between routing-lookup and queue
+    send. Distinct from `queue_full` so a reload churn doesn't masquerade
+    as back-pressure.
   - `buffer_degraded` is `true` if the kernel rejected the agent's
     `SO_RCVBUF=8MB` request — investigate elevated socket-level loss
     via `/proc/net/unix` queue depth if so.
