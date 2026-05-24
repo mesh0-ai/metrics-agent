@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -245,6 +247,114 @@ func TestRegistry_ReloadKeepsPreviousOnParseError(t *testing.T) {
 	if _, ok := reg.lookup("ws-42"); !ok {
 		t.Error("ws-42 lost after bad reload — should keep previous table")
 	}
+}
+
+// TestListenerRoutesToCorrectPipeline is the end-to-end guard: real UDS
+// datagrams with `_project` set must reach the matching pipeline's
+// EventsReceived counter and nowhere else. Missing/unknown projects must
+// land in the process-wide unrouted drop counters.
+//
+// The flusher is not stubbed — pipelineStats.EventsReceived is incremented
+// by the batcher AFTER validateEvent succeeds and BEFORE the flush
+// attempt, so the assertion does not require a fake gateway. Flush
+// failures during the test are expected and irrelevant to the routing
+// contract under test.
+func TestListenerRoutesToCorrectPipeline(t *testing.T) {
+	dir := t.TempDir()
+	keysPath := filepath.Join(dir, "keys.json")
+	if err := os.WriteFile(keysPath, []byte(`{"ws-42":"m0_a","ws-99":"m0_b"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := testConfig()
+	cfg.APIKey = "m0_default" // registered under _default, fallback for no-_project datagrams
+	cfg.KeysFile = keysPath
+	cfg.MaxRetries = 0 // don't burn time retrying against a bogus gateway
+
+	stats := newSelfStats()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	reg := newRegistry(cfg, log, stats)
+	if err := reg.install(); err != nil {
+		t.Fatal(err)
+	}
+	defer reg.shutdown(0)
+
+	sockPath := shortTempSocketPath(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	listenErr := make(chan error, 1)
+	go func() { listenErr <- listen(ctx, sockPath, DefaultMaxEventBytes+1, reg, log, stats) }()
+
+	if err := waitForSocket(sockPath, 500*time.Millisecond); err != nil {
+		t.Fatalf("socket not ready: %v", err)
+	}
+
+	cliAddr, err := net.ResolveUnixAddr("unixgram", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli, err := net.DialUnix("unixgram", nil, cliAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"ws-42 first", `{"_project":"ws-42","operation":"a"}`},
+		{"ws-42 second", `{"_project":"ws-42","operation":"b"}`},
+		{"ws-99 once", `{"_project":"ws-99","operation":"c"}`},
+		{"no _project goes to default", `{"operation":"d"}`},
+		{"unknown project drops", `{"_project":"ws-zzz","operation":"e"}`},
+		{"no _project, multi-tenant + default → default", `{"operation":"f"}`},
+	}
+	for _, c := range cases {
+		if _, err := cli.Write([]byte(c.body)); err != nil {
+			t.Fatalf("%s: write: %v", c.name, err)
+		}
+	}
+
+	waitFor := func(get func() uint64, want uint64) bool {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if get() == want {
+				return true
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		return false
+	}
+
+	p42, _ := reg.lookup("ws-42")
+	p99, _ := reg.lookup("ws-99")
+	pDef, _ := reg.lookup("")
+
+	if !waitFor(p42.stats.EventsReceived.Load, 2) {
+		t.Errorf("ws-42 EventsReceived: got %d want 2", p42.stats.EventsReceived.Load())
+	}
+	if !waitFor(p99.stats.EventsReceived.Load, 1) {
+		t.Errorf("ws-99 EventsReceived: got %d want 1", p99.stats.EventsReceived.Load())
+	}
+	if !waitFor(pDef.stats.EventsReceived.Load, 2) {
+		t.Errorf("_default EventsReceived: got %d want 2", pDef.stats.EventsReceived.Load())
+	}
+	if !waitFor(stats.DropsUnroutedUnknown.Load, 1) {
+		t.Errorf("DropsUnroutedUnknown: got %d want 1", stats.DropsUnroutedUnknown.Load())
+	}
+	// Sanity: cross-tenant leak would show up here.
+	if got := p42.stats.EventsReceived.Load(); got != 2 {
+		t.Errorf("ws-42 leak check: got %d want exactly 2", got)
+	}
+	if got := p99.stats.EventsReceived.Load(); got != 1 {
+		t.Errorf("ws-99 leak check: got %d want exactly 1", got)
+	}
+
+	cancel()
+	<-listenErr
 }
 
 // chanSink is a single-channel listenSink used by tests that exercise the
