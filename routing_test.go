@@ -919,7 +919,7 @@ func TestLoadKeysFile_RejectsWorldWritable(t *testing.T) {
 	}
 }
 
-func TestLoadKeysFile_RejectsSymlink(t *testing.T) {
+func TestLoadKeysFile_AllowsSameDirSymlink(t *testing.T) {
 	dir := t.TempDir()
 	real := filepath.Join(dir, "real.json")
 	link := filepath.Join(dir, "keys.json")
@@ -929,8 +929,54 @@ func TestLoadKeysFile_RejectsSymlink(t *testing.T) {
 	if err := os.Symlink(real, link); err != nil {
 		t.Skipf("symlink unsupported: %v", err)
 	}
+	keys, err := loadKeysFile(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keys["ws-42"] != "m0_a" {
+		t.Errorf("got %+v", keys)
+	}
+}
+
+// TestLoadKeysFile_KubernetesSecretLayout mirrors how kubelet materializes a
+// Secret volume: file → ..data/file, ..data → ..<timestamp> directory.
+func TestLoadKeysFile_KubernetesSecretLayout(t *testing.T) {
+	dir := t.TempDir()
+	tsDir := filepath.Join(dir, "..2026_07_13_17_00_00.123")
+	if err := os.Mkdir(tsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tsDir, "keys.json"), []byte(`{"ws-42":"m0_a"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("..2026_07_13_17_00_00.123", filepath.Join(dir, "..data")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	if err := os.Symlink(filepath.Join("..data", "keys.json"), filepath.Join(dir, "keys.json")); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := loadKeysFile(filepath.Join(dir, "keys.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keys["ws-42"] != "m0_a" {
+		t.Errorf("got %+v", keys)
+	}
+}
+
+func TestLoadKeysFile_RejectsSymlinkEscape(t *testing.T) {
+	outside := t.TempDir()
+	dir := t.TempDir()
+	real := filepath.Join(outside, "real.json")
+	link := filepath.Join(dir, "keys.json")
+	if err := os.WriteFile(real, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
 	if _, err := loadKeysFile(link); err == nil {
-		t.Fatal("expected error for symlinked keys file")
+		t.Fatal("expected error for symlink escaping the keys directory")
 	}
 }
 

@@ -4,6 +4,13 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- **Fixed: keys file refused under Kubernetes Secret mounts.** kubelet
+  materializes Secret volume files as symlinks (`keys.json →
+  ..data/keys.json → ..<timestamp>/keys.json`), so the O_NOFOLLOW open of
+  `MESH0_KEYS_FILE` failed at startup with `keys file … is a symlink
+  (refusing for safety)` and the sidecar crash-looped. Symlinks are now
+  followed when they resolve to a regular file inside the keys file's own
+  directory; links resolving anywhere else are still refused.
 - **Multi-tenant routing.** A single sidecar can now ship events for many
   mesh0 projects from one host. Callers add an optional top-level
   `_project` field to each datagram; the agent strips it and POSTs to

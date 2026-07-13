@@ -231,8 +231,12 @@ table, spawns pipelines for added projects, drains pipelines for removed
 projects, and replaces pipelines whose key rotated. A parse error keeps
 the previous table — a bad reload does not take the agent down.
 
-The keys file is opened with `O_NOFOLLOW` and rejected if it is a symlink,
-a non-regular file, world-writable, or larger than 1 MiB. Keep it
+The keys file is opened with `O_NOFOLLOW` and rejected if it is a
+non-regular file, world-writable, or larger than 1 MiB. A symlink is
+followed only when it resolves to a regular file **inside the keys file's
+own directory** — this is how Kubernetes Secret volumes present files
+(`keys.json → ..data/keys.json`), so Secret mounts work out of the box;
+links resolving anywhere else are refused. Keep it
 **mode `0600`** (or `0640` if the agent runs as its own uid) — a writable
 keys file is effectively a root credential for every registered tenant.
 Pin the file count to your scale via `MESH0_MAX_PROJECTS`.

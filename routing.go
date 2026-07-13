@@ -9,7 +9,9 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -605,17 +607,14 @@ const keysFileMaxBytes = 1 << 20
 //
 // The file is opened with O_NOFOLLOW so an attacker who can replace the
 // configured path with a symlink cannot redirect us to read arbitrary files.
-// World-writable files are rejected (a writable keys file is effectively a
-// per-process root credential for every registered tenant — operators should
-// keep it 0600 or 0640). The read is capped at keysFileMaxBytes.
+// Symlinks that resolve within the file's own directory are followed — see
+// openKeysFile — because Kubernetes Secret volumes always present files that
+// way. World-writable files are rejected (a writable keys file is effectively
+// a per-process root credential for every registered tenant — operators
+// should keep it 0600 or 0640). The read is capped at keysFileMaxBytes.
 func loadKeysFile(path string) (map[string]string, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, err := openKeysFile(path)
 	if err != nil {
-		// ELOOP from O_NOFOLLOW surfaces as a "too many levels of symbolic
-		// links" syscall error; wrap to make the security context explicit.
-		if errors.Is(err, syscall.ELOOP) {
-			return nil, fmt.Errorf("keys file %q is a symlink (refusing for safety)", path)
-		}
 		return nil, err
 	}
 	defer f.Close()
@@ -653,6 +652,37 @@ func loadKeysFile(path string) (map[string]string, error) {
 		}
 	}
 	return raw, nil
+}
+
+// openKeysFile opens the keys file, refusing symlinks that escape the file's
+// own directory. Kubernetes Secret volumes always present files as symlinks
+// (`keys.json → ..data/keys.json`, with `..data` itself a symlink to a
+// timestamped directory inside the mount), so a flat O_NOFOLLOW open can
+// never start under the agent's primary deployment mode. Following a link
+// that stays inside the directory adds no reach: an attacker who can plant a
+// symlink there can already overwrite the keys file itself. Links resolving
+// elsewhere (/etc/shadow, /dev/zero) are still refused, which is what the
+// O_NOFOLLOW was protecting against.
+func openKeysFile(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	// ELOOP from O_NOFOLLOW surfaces as a "too many levels of symbolic
+	// links" syscall error.
+	if err == nil || !errors.Is(err, syscall.ELOOP) {
+		return f, err
+	}
+	base, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return nil, err
+	}
+	rel, err := filepath.Rel(base, resolved)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("keys file %q is a symlink resolving outside its directory (refusing for safety)", path)
+	}
+	return os.OpenFile(resolved, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 }
 
 // projectKeyMarker is the cheap prefilter for the no-_project fast path:
