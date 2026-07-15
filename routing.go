@@ -261,7 +261,16 @@ func (r *registry) install() error {
 		}
 	}
 	if len(keys) == 0 {
-		return errors.New("no API keys configured (set MESH0_API_KEY or MESH0_KEYS_FILE)")
+		// Only reachable when MESH0_KEYS_FILE is set (loadConfig requires one
+		// of API_KEY/KEYS_FILE, and API_KEY alone always yields a key). A
+		// readable-but-empty keys file is a normal fresh-deploy state on
+		// Kubernetes: the Secret is templated as `{}` and a reconciler fills
+		// it in after the pod starts. Exiting here would turn that
+		// provisioning window into a crash loop, so start with an empty
+		// routing table and let the keys-file poll / SIGHUP install routes
+		// when they appear. Datagrams arriving meanwhile drop as unrouted.
+		r.log.Warn("keys file has no entries yet, starting with empty routing table",
+			"keys_file", r.cfg.KeysFile)
 	}
 	if r.cfg.MaxProjects > 0 && len(keys) > r.cfg.MaxProjects {
 		return fmt.Errorf("registered projects (%d) exceed MESH0_MAX_PROJECTS (%d); each pipeline costs ~QueueSize*MaxEventBytes of in-flight memory", len(keys), r.cfg.MaxProjects)
@@ -369,6 +378,13 @@ func (r *registry) reload() {
 	}
 
 	prev := r.cur.Load()
+	if prev != nil && keysUnchanged(prev, newKeys) {
+		// Steady-state poll tick: the file re-read succeeded and nothing
+		// changed. Stamp freshness but skip the table swap so periodic polls
+		// don't churn allocations or spam "routing reloaded" every interval.
+		r.LastKeysReloadUnix.Store(time.Now().Unix())
+		return
+	}
 	tbl := r.buildTable(newKeys, prev)
 
 	// Start any freshly-spawned pipelines BEFORE swapping the table, so
@@ -404,6 +420,22 @@ func (r *registry) reload() {
 		"projects", sortedKeys(tbl.pipelines),
 		"has_default", tbl.hasDefault,
 	)
+}
+
+// keysUnchanged reports whether the desired keys map matches the live table
+// exactly — same project set, same API key per project. Used by reload to
+// make the periodic keys-file poll a quiet no-op in the steady state.
+func keysUnchanged(t *routingTable, keys map[string]string) bool {
+	if len(t.pipelines) != len(keys) {
+		return false
+	}
+	for name, key := range keys {
+		p, ok := t.pipelines[name]
+		if !ok || p.apiKey != key {
+			return false
+		}
+	}
+	return true
 }
 
 // buildTable produces a new routingTable that reuses pipelines from prev

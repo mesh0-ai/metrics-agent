@@ -49,6 +49,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.ShutdownGrace != 15*time.Second {
 		t.Errorf("ShutdownGrace default: got %v", cfg.ShutdownGrace)
 	}
+	if cfg.KeysPollInterval != 30*time.Second {
+		t.Errorf("KeysPollInterval default: got %v", cfg.KeysPollInterval)
+	}
 	if cfg.LogLevel != slog.LevelInfo {
 		t.Errorf("LogLevel default: got %v", cfg.LogLevel)
 	}
@@ -221,6 +224,34 @@ func TestLoadConfigValidationRanges(t *testing.T) {
 			want: "MESH0_LOG_LEVEL",
 		},
 		{
+			name: "keys_poll zero disables",
+			env:  map[string]string{"MESH0_KEYS_POLL_MS": "0"},
+			assert: func(t *testing.T, c Config) {
+				if c.KeysPollInterval != 0 {
+					t.Errorf("KeysPollInterval: got %v", c.KeysPollInterval)
+				}
+			},
+		},
+		{
+			name: "keys_poll valid",
+			env:  map[string]string{"MESH0_KEYS_POLL_MS": "5000"},
+			assert: func(t *testing.T, c Config) {
+				if c.KeysPollInterval != 5*time.Second {
+					t.Errorf("KeysPollInterval: got %v", c.KeysPollInterval)
+				}
+			},
+		},
+		{
+			name: "keys_poll negative rejected",
+			env:  map[string]string{"MESH0_KEYS_POLL_MS": "-1"},
+			want: "MESH0_KEYS_POLL_MS",
+		},
+		{
+			name: "keys_poll over ceiling rejected",
+			env:  map[string]string{"MESH0_KEYS_POLL_MS": "3600001"},
+			want: "MESH0_KEYS_POLL_MS",
+		},
+		{
 			name: "gateway and events path overrides",
 			env:  map[string]string{"MESH0_BASE_URL": "https://eu.mesh0.ai", "MESH0_EVENTS_PATH": "/v2/events"},
 			assert: func(t *testing.T, c Config) {
@@ -272,6 +303,7 @@ func clearMesh0Env(t *testing.T) {
 		"MESH0_QUEUE_SIZE",
 		"MESH0_MAX_RETRIES",
 		"MESH0_SHUTDOWN_GRACE_MS",
+		"MESH0_KEYS_POLL_MS",
 		"MESH0_LOG_LEVEL",
 	} {
 		t.Setenv(k, "")

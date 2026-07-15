@@ -37,6 +37,13 @@ type Config struct {
 	// MaxProjects * QueueSize * MaxEventBytes. A misconfigured keys file
 	// (e.g. one entry per request_id) would otherwise OOM the sidecar.
 	MaxProjects int
+	// KeysPollInterval is how often the agent re-reads MESH0_KEYS_FILE on
+	// its own, independent of SIGHUP. On Kubernetes the Secret volume
+	// propagates asynchronously (up to ~a minute after the API write), so an
+	// external SIGHUP sent right after the write can reload stale contents
+	// and never be retried; polling guarantees eventual pickup. 0 disables
+	// polling (SIGHUP-only). Ignored when MESH0_KEYS_FILE is unset.
+	KeysPollInterval time.Duration
 	// RequireProject disables the MESH0_API_KEY fallback for datagrams
 	// arriving without a `_project` field. Recommended for multi-tenant
 	// deployments to surface mis-tagged callers as `unrouted_missing_project`
@@ -59,11 +66,12 @@ func loadConfig() (Config, error) {
 		// Per-pipeline default. Multi-tenant deployments register one
 		// pipeline per project, so the process-wide ceiling is
 		// (QueueSize * registered projects).
-		QueueSize:     2_000,
-		MaxRetries:    4,
-		ShutdownGrace: 15 * time.Second,
-		LogLevel:      slog.LevelInfo,
-		MaxProjects:   64,
+		QueueSize:        2_000,
+		MaxRetries:       4,
+		ShutdownGrace:    15 * time.Second,
+		LogLevel:         slog.LevelInfo,
+		MaxProjects:      64,
+		KeysPollInterval: 30 * time.Second,
 	}
 	if v := os.Getenv("MESH0_BATCH_WINDOW_MS"); v != "" {
 		ms, err := strconv.Atoi(v)
@@ -113,6 +121,13 @@ func loadConfig() (Config, error) {
 			return c, fmt.Errorf("MESH0_MAX_PROJECTS must be an integer in [1, 4096]")
 		}
 		c.MaxProjects = n
+	}
+	if v := os.Getenv("MESH0_KEYS_POLL_MS"); v != "" {
+		ms, err := strconv.Atoi(v)
+		if err != nil || ms < 0 || ms > 3_600_000 {
+			return c, fmt.Errorf("MESH0_KEYS_POLL_MS must be an integer in [0, 3600000] (0 disables polling)")
+		}
+		c.KeysPollInterval = time.Duration(ms) * time.Millisecond
 	}
 	if v := os.Getenv("MESH0_REQUIRE_PROJECT"); v != "" {
 		switch v {
@@ -176,6 +191,7 @@ func main() {
 		"max_event_bytes", cfg.MaxEventBytes,
 		"queue_size", cfg.QueueSize,
 		"keys_file", cfg.KeysFile,
+		"keys_poll", cfg.KeysPollInterval,
 	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -196,12 +212,25 @@ func main() {
 	hupCh := make(chan os.Signal, 1)
 	signal.Notify(hupCh, syscall.SIGHUP)
 	defer signal.Stop(hupCh)
+	// The keys file is also re-read on a timer: an external SIGHUP can race
+	// the async Secret-volume propagation on Kubernetes (reload the old
+	// contents and never fire again), and a sidecar that started before keys
+	// were provisioned would otherwise run keyless until restart. reload() is
+	// a quiet no-op when the file is unchanged, so the tick is cheap.
+	var pollCh <-chan time.Time
+	if cfg.KeysFile != "" && cfg.KeysPollInterval > 0 {
+		ticker := time.NewTicker(cfg.KeysPollInterval)
+		defer ticker.Stop()
+		pollCh = ticker.C
+	}
 	hupDone := make(chan struct{})
 	go func() {
 		defer close(hupDone)
 		for {
 			select {
 			case <-hupCh:
+				reg.reload()
+			case <-pollCh:
 				reg.reload()
 			case <-ctx.Done():
 				return

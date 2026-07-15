@@ -371,6 +371,86 @@ func TestRegistry_ReloadAddsAndRemovesProjects(t *testing.T) {
 	}
 }
 
+// TestRegistry_InstallEmptyKeysFile ensures a readable-but-empty keys file
+// starts an empty routing table instead of exiting. On Kubernetes the mesh0
+// Secret is templated as `{}` at deploy time and a reconciler fills it in
+// after the pod starts — failing install turns that provisioning window into
+// a crash loop. A later reload must then install the first routes.
+func TestRegistry_InstallEmptyKeysFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keys.json")
+	if err := os.WriteFile(path, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig()
+	cfg.APIKey = ""
+	cfg.KeysFile = path
+	stats := newSelfStats()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg := newRegistry(cfg, log, stats)
+	if err := reg.install(); err != nil {
+		t.Fatalf("install with empty keys file must not fail: %v", err)
+	}
+	defer reg.shutdown(0)
+
+	// Nothing routable yet: datagrams drop as unrouted, not crash.
+	reg.dispatch(rawDatagram{bytes: []byte(`{"_project":"ws-42","a":1}`), at: time.Now()})
+	if stats.DropsUnroutedUnknown.Load() != 1 {
+		t.Errorf("unknown drops: got %d", stats.DropsUnroutedUnknown.Load())
+	}
+
+	// Keys arrive (reconciler wrote the Secret): reload installs the route.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatal(err)
+	}
+	reg.reload()
+	if _, ok := reg.lookup("ws-42"); !ok {
+		t.Error("ws-42 not registered after reload")
+	}
+}
+
+// TestRegistry_ReloadUnchangedKeepsPipelines ensures the periodic keys-file
+// poll is a quiet no-op when the contents haven't changed: live pipelines
+// must be reused (no drain/replace churn on every tick) while the freshness
+// timestamp still advances.
+func TestRegistry_ReloadUnchangedKeepsPipelines(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keys.json")
+	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig()
+	cfg.APIKey = ""
+	cfg.KeysFile = path
+	stats := newSelfStats()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg := newRegistry(cfg, log, stats)
+	if err := reg.install(); err != nil {
+		t.Fatal(err)
+	}
+	defer reg.shutdown(0)
+
+	before, ok := reg.lookup("ws-42")
+	if !ok {
+		t.Fatal("ws-42 not registered")
+	}
+	reg.reload()
+	after, ok := reg.lookup("ws-42")
+	if !ok {
+		t.Fatal("ws-42 gone after no-change reload")
+	}
+	if before != after {
+		t.Error("pipeline replaced on no-change reload")
+	}
+	if reg.LastKeysReloadUnix.Load() == 0 {
+		t.Error("freshness timestamp not stamped on no-change reload")
+	}
+}
+
 // TestRegistry_DispatchMalformedBumpsParseError ensures a malformed datagram
 // is counted as parse_error at the routing layer rather than silently
 // forwarded to a pipeline (which would poison the batch with a 4xx).
