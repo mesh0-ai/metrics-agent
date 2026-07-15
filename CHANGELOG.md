@@ -4,6 +4,21 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- **Fixed: crash loop on fresh deploys with an empty keys file.** A readable
+  `MESH0_KEYS_FILE` containing `{}` no longer fails startup — on Kubernetes
+  the mesh0 Secret is templated empty at deploy time and filled in by a
+  reconciler after the pod starts, so the old fail-fast turned that
+  provisioning window into a CrashLoopBackOff. The agent now starts with an
+  empty routing table (datagrams drop as unrouted) and installs routes when
+  keys appear. Startup still fails on an unreadable/unparseable file, and
+  when neither `MESH0_API_KEY` nor `MESH0_KEYS_FILE` is set.
+- **Added: periodic keys-file polling (`MESH0_KEYS_POLL_MS`, default 30s).**
+  The agent re-reads `MESH0_KEYS_FILE` on a timer in addition to `SIGHUP`.
+  Kubernetes propagates Secret volume updates asynchronously, so a `SIGHUP`
+  sent right after the Secret write could reload the stale mount and never
+  fire again, leaving the sidecar on old keys until restart. Unchanged
+  contents are a quiet no-op (pipelines are reused, no log line). `0`
+  disables polling.
 - **Fixed: keys file refused under Kubernetes Secret mounts.** kubelet
   materializes Secret volume files as symlinks (`keys.json →
   ..data/keys.json → ..<timestamp>/keys.json`), so the O_NOFOLLOW open of
