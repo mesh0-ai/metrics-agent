@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -1075,6 +1076,72 @@ func TestInstall_RejectsTooManyProjects(t *testing.T) {
 	reg := newRegistry(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), newSelfStats())
 	if err := reg.install(); err == nil {
 		t.Fatal("expected install to reject 3 projects with MaxProjects=2")
+	}
+}
+
+// 0 means unlimited, and it is the default. The cap defends against a
+// misconfigured keys file; a legitimate one that simply has many projects
+// must install in full rather than have the whole file rejected, which
+// routes nothing at all and is silent on the caller's side.
+func TestRegistry_MaxProjectsZeroMeansUnlimited(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keys.json")
+	keys := map[string]string{}
+	for i := 0; i < 200; i++ {
+		keys[fmt.Sprintf("ws-%d", i)] = fmt.Sprintf("k%d", i)
+	}
+	body, _ := json.Marshal(keys)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig()
+	cfg.APIKey = ""
+	cfg.KeysFile = path
+	cfg.MaxProjects = 0
+	reg := newRegistry(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), newSelfStats())
+	if err := reg.install(); err != nil {
+		t.Fatalf("install with MaxProjects=0 must accept 200 projects: %v", err)
+	}
+	defer reg.shutdown(0)
+	if got := len(reg.cur.Load().pipelines); got != 200 {
+		t.Fatalf("registered pipelines: got %d, want 200", got)
+	}
+}
+
+// The reload path has its own cap check, so unlimited has to hold there too
+// — this is the one that fired in production, rejecting a 149-entry file
+// every 30s and keeping an empty table.
+func TestRegistry_MaxProjectsZeroMeansUnlimitedOnReload(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keys.json")
+	if err := os.WriteFile(path, []byte(`{"ws-1":"k1"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig()
+	cfg.APIKey = ""
+	cfg.KeysFile = path
+	cfg.MaxProjects = 0
+	reg := newRegistry(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), newSelfStats())
+	if err := reg.install(); err != nil {
+		t.Fatal(err)
+	}
+	defer reg.shutdown(0)
+
+	keys := map[string]string{}
+	for i := 0; i < 200; i++ {
+		keys[fmt.Sprintf("ws-%d", i)] = fmt.Sprintf("k%d", i)
+	}
+	body, _ := json.Marshal(keys)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reg.reload()
+
+	if got := len(reg.cur.Load().pipelines); got != 200 {
+		t.Fatalf("reloaded pipelines: got %d, want 200", got)
+	}
+	if got := reg.KeysReloadFailures.Load(); got != 0 {
+		t.Fatalf("KeysReloadFailures: got %d, want 0", got)
 	}
 }
 

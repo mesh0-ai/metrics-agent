@@ -52,6 +52,12 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.KeysPollInterval != 30*time.Second {
 		t.Errorf("KeysPollInterval default: got %v", cfg.KeysPollInterval)
 	}
+	// 0 = unlimited. A keys file is written wholesale by a control plane, so
+	// a cap that a legitimate file exceeds rejects the WHOLE file and routes
+	// nothing — a worse failure than the memory growth it guards against.
+	if cfg.MaxProjects != 0 {
+		t.Errorf("MaxProjects default: got %d, want 0 (unlimited)", cfg.MaxProjects)
+	}
 	if cfg.LogLevel != slog.LevelInfo {
 		t.Errorf("LogLevel default: got %v", cfg.LogLevel)
 	}
@@ -196,6 +202,36 @@ func TestLoadConfigValidationRanges(t *testing.T) {
 			want: "MESH0_MAX_RETRIES",
 		},
 		{
+			// 0 is the unlimited sentinel, not a rejected value.
+			name: "max_projects zero allowed (unlimited)",
+			env:  map[string]string{"MESH0_MAX_PROJECTS": "0"},
+			assert: func(t *testing.T, c Config) {
+				if c.MaxProjects != 0 {
+					t.Errorf("MaxProjects: got %d", c.MaxProjects)
+				}
+			},
+		},
+		{
+			name: "max_projects positive allowed",
+			env:  map[string]string{"MESH0_MAX_PROJECTS": "512"},
+			assert: func(t *testing.T, c Config) {
+				if c.MaxProjects != 512 {
+					t.Errorf("MaxProjects: got %d", c.MaxProjects)
+				}
+			},
+		},
+		{
+			name: "max_projects over cap rejected",
+			env:  map[string]string{"MESH0_MAX_PROJECTS": "4097"},
+			want: "MESH0_MAX_PROJECTS",
+		},
+		{
+			// Negative is NOT a synonym for unlimited.
+			name: "max_projects negative rejected",
+			env:  map[string]string{"MESH0_MAX_PROJECTS": "-1"},
+			want: "MESH0_MAX_PROJECTS",
+		},
+		{
 			name: "shutdown_grace zero allowed",
 			env:  map[string]string{"MESH0_SHUTDOWN_GRACE_MS": "0"},
 			assert: func(t *testing.T, c Config) {
@@ -304,6 +340,7 @@ func clearMesh0Env(t *testing.T) {
 		"MESH0_MAX_RETRIES",
 		"MESH0_SHUTDOWN_GRACE_MS",
 		"MESH0_KEYS_POLL_MS",
+		"MESH0_MAX_PROJECTS",
 		"MESH0_LOG_LEVEL",
 	} {
 		t.Setenv(k, "")
