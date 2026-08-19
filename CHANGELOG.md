@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- **Changed: `MESH0_MAX_PROJECTS` now defaults to `0` (unlimited), and `0` is
+  an accepted value.** The previous default of `64` rejected the *entire*
+  keys file whenever a deployment legitimately exceeded it, so the agent
+  installed no routes at all and every project went silent — observed in
+  production as a 149-entry file rejected every 30 seconds while the agent
+  held an empty routing table. A keys file is written wholesale by a control
+  plane, so the cap cannot degrade gracefully by truncating: it is
+  all-or-nothing, and the failure is invisible on the caller's side. The
+  guard is still available for deployments that want it — set a positive
+  value sized against your own keys file. `install` and reload already
+  treated `0` as unlimited; only the env parser rejected it (`[1, 4096]` is
+  now `[0, 4096]`). A negative value is still rejected rather than read as
+  unlimited.
+
 - **Fixed: crash loop on fresh deploys with an empty keys file.** A readable
   `MESH0_KEYS_FILE` containing `{}` no longer fails startup — on Kubernetes
   the mesh0 Secret is templated empty at deploy time and filled in by a

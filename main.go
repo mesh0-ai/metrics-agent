@@ -34,8 +34,20 @@ type Config struct {
 	// MaxProjects bounds the number of registered pipelines (including the
 	// MESH0_API_KEY fallback). Each pipeline owns a per-project queue, two
 	// goroutines, and an http.Client — worst-case in-flight memory is
-	// MaxProjects * QueueSize * MaxEventBytes. A misconfigured keys file
-	// (e.g. one entry per request_id) would otherwise OOM the sidecar.
+	// MaxProjects * QueueSize * MaxEventBytes.
+	//
+	// 0 means UNLIMITED and is the default. The cap exists to stop a
+	// MISCONFIGURED keys file (e.g. one entry per request_id) spawning
+	// unbounded goroutines, but it defends against a shape of bug that has
+	// not occurred while reliably breaking a legitimate one that has: a
+	// keys file is written wholesale by a control plane, so a real
+	// deployment with more projects than the cap has its ENTIRE file
+	// rejected and routes nothing at all. Silence for every project is a
+	// worse failure than the memory growth the ceiling was guarding, and it
+	// is not self-announcing on the caller's side.
+	//
+	// Deployments that want the guard set MESH0_MAX_PROJECTS to a positive
+	// value and size it against their own keys file.
 	MaxProjects int
 	// KeysPollInterval is how often the agent re-reads MESH0_KEYS_FILE on
 	// its own, independent of SIGHUP. On Kubernetes the Secret volume
@@ -70,7 +82,7 @@ func loadConfig() (Config, error) {
 		MaxRetries:       4,
 		ShutdownGrace:    15 * time.Second,
 		LogLevel:         slog.LevelInfo,
-		MaxProjects:      64,
+		MaxProjects:      0,
 		KeysPollInterval: 30 * time.Second,
 	}
 	if v := os.Getenv("MESH0_BATCH_WINDOW_MS"); v != "" {
@@ -117,8 +129,11 @@ func loadConfig() (Config, error) {
 	}
 	if v := os.Getenv("MESH0_MAX_PROJECTS"); v != "" {
 		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 || n > 4096 {
-			return c, fmt.Errorf("MESH0_MAX_PROJECTS must be an integer in [1, 4096]")
+		// 0 is accepted and means unlimited, matching the default and the
+		// `MaxProjects > 0` guards in routing.go. A NEGATIVE value is
+		// rejected rather than read as unlimited, so "-1" is not a synonym.
+		if err != nil || n < 0 || n > 4096 {
+			return c, fmt.Errorf("MESH0_MAX_PROJECTS must be an integer in [0, 4096] (0 disables the cap)")
 		}
 		c.MaxProjects = n
 	}
