@@ -46,6 +46,10 @@ type rawDatagram struct {
 	bytes   []byte
 	at      time.Time
 	project string
+	// token is the per-datagram credential recovered from `_token`, empty
+	// when the datagram carried none. Deployments that publish a keys file
+	// leave this empty and authenticate from the pipeline's configured key.
+	token string
 }
 
 // EventBatch is the unit handed to the events flusher. The Events slice is a
@@ -54,6 +58,18 @@ type rawDatagram struct {
 type EventBatch struct {
 	Events    []json.RawMessage
 	StartedAt time.Time
+	// Token authorizes THIS batch, when its datagrams carried one. Empty
+	// means "use the flusher's configured key" — the keys-file path.
+	//
+	// 🛑 THE CREDENTIAL TRAVELS WITH THE EVENTS IT AUTHORIZES, rather than
+	// being read off the pipeline at POST time. A pipeline's token rotates
+	// (~every 10 minutes for a Xano instance), and a batch assembled before
+	// a rotation but flushed after it would otherwise be sent under a
+	// credential minted for a different moment. Both are valid for the same
+	// project, so this is not a correctness bug today — but it makes the
+	// batch self-describing, which is what lets a retry hours later still
+	// carry the credential that was current when the events were accepted.
+	Token string
 }
 
 type validateReason int
@@ -164,6 +180,7 @@ type eventsBatcher struct {
 
 	cur       []json.RawMessage
 	curBytes  int
+	curToken  string
 	firstSeen time.Time
 }
 
@@ -254,6 +271,13 @@ func (b *eventsBatcher) run() {
 			}
 			b.cur = append(b.cur, ev)
 			b.curBytes += len(ev) + 1 // comma between elements
+			// Last-wins. A rotation mid-batch leaves the batch carrying the
+			// FRESHER credential, which is the one with more remaining life
+			// against the gateway's clock — the direction that matters when
+			// the flusher retries with backoff.
+			if dg.token != "" {
+				b.curToken = dg.token
+			}
 			if len(b.cur) >= b.maxEvents {
 				b.flush()
 				disarmTimer()
@@ -269,9 +293,10 @@ func (b *eventsBatcher) flush() {
 	if len(b.cur) == 0 {
 		return
 	}
-	batch := EventBatch{Events: b.cur, StartedAt: b.firstSeen}
+	batch := EventBatch{Events: b.cur, StartedAt: b.firstSeen, Token: b.curToken}
 	b.cur = nil
 	b.curBytes = 0
+	b.curToken = ""
 	b.firstSeen = time.Time{}
 	if b.ctx == nil {
 		b.out <- batch

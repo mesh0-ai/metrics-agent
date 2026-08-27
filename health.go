@@ -32,6 +32,9 @@ func startHealthServer(addr string, stats *selfStats, reg *registry, log *slog.L
 			snap.ByProject = reg.snapshot()
 			snap.KeysReloadFailures = reg.KeysReloadFailures.Load()
 			snap.LastKeysReloadUnix = reg.LastKeysReloadUnix.Load()
+			snap.InlineProjectsRegistered = reg.InlineProjectsRegistered.Load()
+			snap.InlineProjectsExpired = reg.InlineProjectsExpired.Load()
+			snap.InlineProjectsLive = reg.inlineLive()
 		}
 		_ = json.NewEncoder(w).Encode(snap)
 	})

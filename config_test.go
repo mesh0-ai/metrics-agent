@@ -63,10 +63,50 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 }
 
-func TestLoadConfigRequiresAPIKey(t *testing.T) {
+func TestLoadConfigRequiresAPIKeyWhenInlineDisabled(t *testing.T) {
+	// The guard now applies only when inline tokens are off. With them on
+	// (the default) a deployment legitimately declares no credential up
+	// front — it arrives on the datagram.
 	clearMesh0Env(t)
+	t.Setenv("MESH0_INLINE_TOKENS", "0")
 	if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "MESH0_API_KEY") {
 		t.Fatalf("expected MESH0_API_KEY required error, got %v", err)
+	}
+}
+
+func TestLoadConfigAllowsNoCredentialWhenInlineEnabled(t *testing.T) {
+	clearMesh0Env(t)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if !cfg.InlineTokens {
+		t.Fatalf("InlineTokens default: got false, want true")
+	}
+	if cfg.InlineIdle != 15*time.Minute {
+		t.Errorf("InlineIdle default: got %v, want 15m", cfg.InlineIdle)
+	}
+}
+
+func TestLoadConfigInlineIdleRange(t *testing.T) {
+	for _, v := range []string{"-1", "86400001", "abc"} {
+		t.Run(v, func(t *testing.T) {
+			clearMesh0Env(t)
+			t.Setenv("MESH0_INLINE_IDLE_MS", v)
+			if _, err := loadConfig(); err == nil {
+				t.Fatalf("expected error for MESH0_INLINE_IDLE_MS=%s", v)
+			}
+		})
+	}
+	// 0 is accepted and disables expiry.
+	clearMesh0Env(t)
+	t.Setenv("MESH0_INLINE_IDLE_MS", "0")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.InlineIdle != 0 {
+		t.Errorf("InlineIdle: got %v, want 0", cfg.InlineIdle)
 	}
 }
 

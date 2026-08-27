@@ -131,7 +131,13 @@ func (f *eventsFlusher) send(batch EventBatch) {
 				goto fail
 			}
 		}
-		err := postJSON(f.ctx, f.httpClient, f.url, f.apiKey, body)
+		// The batch's own credential when it carried one, else the
+		// pipeline's configured key. Empty Token is the keys-file path.
+		key := f.apiKey
+		if batch.Token != "" {
+			key = batch.Token
+		}
+		err := postJSON(f.ctx, f.httpClient, f.url, key, body)
 		if err == nil {
 			f.stats.BatchesSent.Add(1)
 			f.stats.EventsSent.Add(uint64(len(batch.Events)))
