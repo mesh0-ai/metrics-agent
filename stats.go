@@ -32,7 +32,14 @@ type selfStats struct {
 	// operators chasing a "queue saturated" alert don't get misdirected to
 	// a project that's actually been removed/replaced via reload.
 	DropsRoutingClosed atomic.Uint64
-	ReadErrors         atomic.Uint64
+	// DropsBadToken counts datagrams carrying a `_token` that was present
+	// but not a JSON string. Distinct from unrouted_unknown_project on
+	// purpose: the routing intent was fine, the CREDENTIAL was unusable,
+	// and those have different owners — a bad project name is a mis-tagged
+	// caller, a bad token is a broken credential path. Conflating them
+	// would send an operator to the wrong side of the system.
+	DropsBadToken    atomic.Uint64
+	ReadErrors       atomic.Uint64
 	BufferDegraded   atomic.Bool  // kernel rejected the requested SO_RCVBUF
 	ListenerFatal    atomic.Bool  // listener goroutine exited unexpectedly
 	LastEventFlushMs atomic.Int64 // unix-millis of last successful event flush
@@ -61,6 +68,14 @@ type statsSnapshot struct {
 	// LastKeysReloadUnix means operators are running on an outdated table.
 	KeysReloadFailures uint64 `json:"keys_reload_failures,omitempty"`
 	LastKeysReloadUnix int64  `json:"last_keys_reload_unix,omitempty"`
+	// InlineProjects* describe the on-demand `_token` population: how many
+	// pipelines have been registered from a datagram's own credential, how
+	// many were later retired for idleness, and how many are live now. An
+	// operator watching a tenant-churning instance reads these to see the
+	// population turning over rather than growing.
+	InlineProjectsRegistered uint64 `json:"inline_projects_registered,omitempty"`
+	InlineProjectsExpired    uint64 `json:"inline_projects_expired,omitempty"`
+	InlineProjectsLive       int    `json:"inline_projects_live,omitempty"`
 }
 
 type dropStats struct {
@@ -72,6 +87,7 @@ type dropStats struct {
 	RoutingClosed   uint64 `json:"routing_closed,omitempty"`
 	UnroutedMissing uint64 `json:"unrouted_missing_project,omitempty"`
 	UnroutedUnknown uint64 `json:"unrouted_unknown_project,omitempty"`
+	BadToken        uint64 `json:"bad_token,omitempty"`
 }
 
 // pipelineStats tracks the per-project subset of counters. These count
@@ -89,6 +105,7 @@ type dropStats struct {
 //	+ selfStats.DropsParseError                       (routing-strip malformed)
 //	+ selfStats.DropsUnroutedMissing
 //	+ selfStats.DropsUnroutedUnknown
+//	+ selfStats.DropsBadToken
 //	(± in-flight races between the listener bump and the pipeline bump)
 //
 // Per-project visibility lets operators attribute drops to a specific
@@ -162,6 +179,7 @@ func (s *selfStats) snapshot() statsSnapshot {
 			RoutingClosed:   s.DropsRoutingClosed.Load(),
 			UnroutedMissing: s.DropsUnroutedMissing.Load(),
 			UnroutedUnknown: s.DropsUnroutedUnknown.Load(),
+			BadToken:        s.DropsBadToken.Load(),
 		},
 		BatchesSent:    s.BatchesSent.Load(),
 		EventsSent:     s.EventsSent.Load(),

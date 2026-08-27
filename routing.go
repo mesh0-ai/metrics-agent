@@ -45,6 +45,15 @@ type pipeline struct {
 	project string
 	apiKey  string
 
+	// inline marks a pipeline created on demand from a datagram's `_token`
+	// rather than from the keys file. Only these are subject to idle
+	// expiry: a keys-file pipeline is an operator's declaration and stays
+	// registered whether or not traffic arrives.
+	inline bool
+	// lastSeen is unix-nanos of the most recent datagram dispatched here.
+	// Written on the listener's hot path, so an atomic rather than a lock.
+	lastSeen atomic.Int64
+
 	rawCh   chan rawDatagram
 	batchCh chan EventBatch
 
@@ -111,7 +120,7 @@ func newPipeline(project, apiKey string, cfg Config, log *slog.Logger, processSt
 	b.ctx = ctx
 	f.ctx = ctx
 
-	return &pipeline{
+	p := &pipeline{
 		project:     project,
 		apiKey:      apiKey,
 		rawCh:       rawCh,
@@ -124,6 +133,8 @@ func newPipeline(project, apiKey string, cfg Config, log *slog.Logger, processSt
 		batcherDone: make(chan struct{}),
 		flushDone:   make(chan struct{}),
 	}
+	p.lastSeen.Store(time.Now().UnixNano())
+	return p
 }
 
 func (p *pipeline) start() {
@@ -214,6 +225,20 @@ type registry struct {
 	// produce diverging tables. Read path (lookup) is lock-free via
 	// atomic.Pointer.
 	reloadMu sync.Mutex
+
+	// inlineMu serialises on-demand registration of `_token` pipelines.
+	// Distinct from reloadMu because the two contend on different paths:
+	// reload is a signal handler, inline registration happens on the
+	// listener's dispatch path the first time a project is seen. Both
+	// publish through the same copy-on-write swap of cur.
+	inlineMu sync.Mutex
+
+	// InlineProjectsRegistered counts pipelines created from an inline
+	// `_token`. InlineProjectsExpired counts those later retired for
+	// idleness. Both surface in /stats so an operator can see the inline
+	// population without reading logs.
+	InlineProjectsRegistered atomic.Uint64
+	InlineProjectsExpired    atomic.Uint64
 
 	// drainsInFlight tracks reload-initiated drain goroutines so shutdown
 	// can wait on them and they aren't orphaned if SIGHUP races SIGTERM.
@@ -505,12 +530,12 @@ func (r *registry) lookup(project string) (*pipeline, bool) {
 // own handoff buffer is full (a single noisy project), distinct from
 // process-wide queue_full (shared queue exhausted).
 func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
-	project, stripped, removed, malformed, badProject := extractAndStripProject(dg.bytes)
-	if malformed {
+	f := extractAndStripRouting(dg.bytes)
+	if f.malformed {
 		r.processStats.DropsParseError.Add(1)
 		return false, false
 	}
-	if badProject {
+	if f.badProject {
 		// `_project` was present but not a JSON string. JSON is structurally
 		// valid; the routing intent is unusable. Account as unrouted_unknown
 		// so an alert on that counter catches malformed client SDKs without
@@ -518,10 +543,34 @@ func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
 		r.processStats.DropsUnroutedUnknown.Add(1)
 		return false, false
 	}
-	if removed {
-		dg.bytes = stripped
+	project := f.project
+	if f.removed {
+		// Note this assignment happens for a stripped `_token` too, even on
+		// the drop paths below — the credential is out of the body before
+		// anything else can happen to it.
+		dg.bytes = f.stripped
 	}
+	if f.badToken && r.cfg.InlineTokens {
+		// Present but unusable. NOT silently downgraded to the keys-file
+		// credential: a caller that meant to authenticate with a token and
+		// got the type wrong must not be quietly authorized as somebody
+		// else, and on an empty keys file that downgrade is a drop anyway.
+		r.processStats.DropsBadToken.Add(1)
+		return false, false
+	}
+	if r.cfg.InlineTokens {
+		dg.token = f.token
+	}
+
 	p, ok := r.lookup(project)
+	if !ok && r.cfg.InlineTokens && f.token != "" && project != "" {
+		// On-demand registration. A datagram that names a project AND
+		// carries its own credential needs no keys-file entry — the
+		// credential IS the authorization, and the gateway resolves the
+		// project from the token's own claim. This is the whole path for
+		// deployments that mint per-instance tokens and publish no keys.
+		p, ok = r.registerInline(project)
+	}
 	if !ok {
 		if project == "" {
 			r.processStats.DropsUnroutedMissing.Add(1)
@@ -530,6 +579,7 @@ func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
 		}
 		return false, false
 	}
+	p.lastSeen.Store(dg.at.UnixNano())
 	// Early closed-pipeline check. If the pipeline was already drained at
 	// dispatch time (pre-drain in tests, or a reload that retired the
 	// project before this dispatch fired), short-circuit with synchronous
@@ -569,6 +619,166 @@ func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
 	default:
 		r.sharedSendMu.RUnlock()
 		return false, true
+	}
+}
+
+// registerInline creates and publishes a pipeline for a project first seen on
+// a datagram carrying its own `_token`. Returns the pipeline and true when the
+// project is routable afterwards.
+//
+// WHY THIS EXISTS. Under the keys-file model an operator declares every
+// project up front, so an unknown `_project` is a mis-tagged caller and
+// dropping it is right. Under inline credentials there is nothing to declare:
+// the emitting instance mints a token whose own claim names the project, and
+// the first this agent hears of that project is the datagram in hand. Without
+// on-demand registration such a deployment routes nothing at all — which is
+// exactly the empty-keys-file silence this path was built to end.
+//
+// The pipeline is created with an EMPTY apiKey. That is deliberate and load
+// bearing: an inline pipeline has no credential of its own, and every batch it
+// flushes must carry the token that arrived with its events (EventBatch.Token).
+// Giving it a fallback key would let a rotation gap or a stripped token
+// silently authenticate one project's events under another credential.
+//
+// MaxProjects is enforced here as well as on the keys file, and the two share
+// a budget: an inline registration that would exceed the cap is refused and the
+// datagram drops as unrouted_unknown, which is the same outcome an unknown
+// project has always had.
+func (r *registry) registerInline(project string) (*pipeline, bool) {
+	r.inlineMu.Lock()
+	defer r.inlineMu.Unlock()
+
+	// Re-check under the lock: several datagrams for a new project can race
+	// into dispatch together, and only the first may create the pipeline.
+	if p, ok := r.lookup(project); ok {
+		return p, true
+	}
+
+	prev := r.cur.Load()
+	if prev != nil && r.cfg.MaxProjects > 0 && len(prev.pipelines) >= r.cfg.MaxProjects {
+		r.log.Warn("inline project registration refused: max_projects reached",
+			"project", project, "max_projects", r.cfg.MaxProjects)
+		return nil, false
+	}
+
+	p := newPipeline(project, "", r.cfg, r.log, r.processStats)
+	p.inline = true
+	p.start()
+
+	// Copy-on-write publish, same discipline as reload: readers hold the old
+	// table until the atomic swap, so lookup stays lock-free.
+	next := &routingTable{pipelines: make(map[string]*pipeline, lenPipelines(prev)+1)}
+	if prev != nil {
+		for name, existing := range prev.pipelines {
+			next.pipelines[name] = existing
+		}
+		next.hasDefault = prev.hasDefault
+	}
+	next.pipelines[project] = p
+	r.cur.Store(next)
+
+	r.InlineProjectsRegistered.Add(1)
+	r.log.Info("inline project registered from datagram credential",
+		"project", project, "projects", len(next.pipelines))
+	return p, true
+}
+
+func lenPipelines(t *routingTable) int {
+	if t == nil {
+		return 0
+	}
+	return len(t.pipelines)
+}
+
+// expireInline retires inline pipelines idle for longer than idle. Keys-file
+// pipelines are never touched: an operator declared those, and a project that
+// happens to be quiet is not a project that has gone away.
+//
+// Returns the number retired. Safe to call concurrently with dispatch — the
+// swap is copy-on-write and the drain runs after the retired pipeline is no
+// longer reachable from the published table, so a dispatch that grabbed it
+// just before the swap still delivers (or accounts routing_closed, which the
+// existing closed-pipeline path already handles).
+func (r *registry) expireInline(idle time.Duration, now time.Time) int {
+	if idle <= 0 {
+		return 0
+	}
+	r.inlineMu.Lock()
+
+	prev := r.cur.Load()
+	if prev == nil {
+		r.inlineMu.Unlock()
+		return 0
+	}
+	cutoff := now.Add(-idle).UnixNano()
+	var retired []*pipeline
+	for name, p := range prev.pipelines {
+		if p.inline && p.lastSeen.Load() < cutoff {
+			retired = append(retired, p)
+			_ = name
+		}
+	}
+	if len(retired) == 0 {
+		r.inlineMu.Unlock()
+		return 0
+	}
+
+	next := &routingTable{
+		pipelines:  make(map[string]*pipeline, len(prev.pipelines)-len(retired)),
+		hasDefault: prev.hasDefault,
+	}
+	for name, p := range prev.pipelines {
+		keep := true
+		for _, dead := range retired {
+			if dead == p {
+				keep = false
+				break
+			}
+		}
+		if keep {
+			next.pipelines[name] = p
+		}
+	}
+	r.cur.Store(next)
+	r.inlineMu.Unlock()
+
+	// Drain OUTSIDE the lock and after the swap: draining flushes in-flight
+	// batches, which can take up to the shutdown grace, and holding
+	// inlineMu across that would block every new project registration.
+	for _, p := range retired {
+		r.drainsInFlight.Add(1)
+		go func(dead *pipeline) {
+			defer r.drainsInFlight.Done()
+			dead.drain(r.cfg.ShutdownGrace)
+			r.InlineProjectsExpired.Add(1)
+			r.log.Info("inline project expired (idle)", "project", dead.project)
+		}(p)
+	}
+	return len(retired)
+}
+
+// runInlineExpiry ticks expireInline until stop closes. Started from main
+// only when both an idle window and a keys-less/inline deployment make it
+// meaningful; a zero idle window disables it entirely.
+func (r *registry) runInlineExpiry(idle time.Duration, stop <-chan struct{}) {
+	if idle <= 0 {
+		return
+	}
+	// Check several times per window so a pipeline is retired reasonably
+	// close to its deadline without a timer per pipeline.
+	tick := idle / 4
+	if tick < time.Second {
+		tick = time.Second
+	}
+	t := time.NewTicker(tick)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case now := <-t.C:
+			r.expireInline(idle, now)
+		}
 	}
 }
 
@@ -615,6 +825,22 @@ func (r *registry) closeShared() {
 }
 
 // snapshot returns a per-project view of pipeline counters for /stats.
+// inlineLive counts the currently-registered inline pipelines. Read from the
+// published table, so it reflects what dispatch would find right now.
+func (r *registry) inlineLive() int {
+	t := r.cur.Load()
+	if t == nil {
+		return 0
+	}
+	n := 0
+	for _, p := range t.pipelines {
+		if p.inline {
+			n++
+		}
+	}
+	return n
+}
+
 func (r *registry) snapshot() map[string]projectStatsSnapshot {
 	t := r.cur.Load()
 	if t == nil {
@@ -724,18 +950,72 @@ func openKeysFile(path string) (*os.File, error) {
 // through to the scanner, which then correctly reports removed=false.
 var projectKeyMarker = []byte(`"_project"`)
 
-// projectKey is the bare key name compared against unquoted JSON key bytes
-// during the top-level walk. projectKeyBytes is the precomputed []byte form
-// used by bytes.Equal so we don't pay []byte(const) per match.
+// tokenKeyMarker is the same prefilter for `_token`, the per-datagram
+// credential used by deployments that mint their own instance tokens instead
+// of publishing a keys file. See extractAndStripFields.
+var tokenKeyMarker = []byte(`"_token"`)
+
+// projectKey / tokenKey are the bare key names compared against unquoted JSON
+// key bytes during the top-level walk. The *Bytes forms are precomputed so we
+// don't pay []byte(const) per match.
 const projectKey = "_project"
 
+const tokenKey = "_token"
+
 var projectKeyBytes = []byte(projectKey)
+
+var tokenKeyBytes = []byte(tokenKey)
 
 // maxScanDepth caps nesting in scanContainer. A 1 MB datagram of nothing but
 // `[` is legal JSON to encoding/json but useless to us; the cap turns
 // adversarial deep nesting into a parse_error drop without affecting any
 // realistic payload.
 const maxScanDepth = 256
+
+// routingFields is what one pass of the top-level scanner recovered from a
+// datagram: where it should be routed, what credential authorizes it, and the
+// body with both of those members removed.
+//
+// 🛑 BOTH MEMBERS ARE STRIPPED, AND FOR `_token` THAT IS NOT MERELY ABOUT THE
+// GATEWAY'S DisallowUnknownFields. A `_token` left in the body is a live
+// credential written into stored telemetry, readable by anyone who can later
+// read the event back. It must not survive this function.
+type routingFields struct {
+	project string
+	token   string
+
+	stripped  []byte
+	removed   bool
+	malformed bool
+
+	// badProject / badToken: the member was present but its last occurrence
+	// was not a JSON string. The body is still well-formed; the intent is
+	// unusable. Kept separate because they route to different drops — a bad
+	// project is unrouted_unknown, a bad token is a credential fault.
+	badProject bool
+	badToken   bool
+}
+
+// extractAndStripProject is the `_project`-only entry point, preserved with
+// its exact original behavior.
+//
+// It is NOT a thin alias for the two-field scan: a body carrying only `_token`
+// must come back from THIS function untouched, with removed=false. The
+// `_project` contract predates inline credentials, and its test suite —
+// including the differential fuzz against encoding/json — is written against
+// that shape. Widening it in place would silently change what the fuzz is
+// comparing.
+func extractAndStripProject(b []byte) (project string, stripped []byte, removed, malformed, badProject bool) {
+	f := extractAndStripFields(b, false)
+	return f.project, f.stripped, f.removed, f.malformed, f.badProject
+}
+
+// extractAndStripRouting is the two-field scan used by dispatch: `_project`
+// for routing and `_token` for the credential, both removed from the body in
+// the same single pass.
+func extractAndStripRouting(b []byte) routingFields {
+	return extractAndStripFields(b, true)
+}
 
 // extractAndStripProject pulls `_project` out of a top-level JSON object and
 // returns (project, bytes-without-_project, removed, malformed, badProject).
@@ -763,21 +1043,27 @@ const maxScanDepth = 256
 // 5–10× slower on this hot path because it boxes every token into an
 // interface{} and allocates a fresh json.RawMessage per value. Behavior is
 // cross-checked against encoding/json by FuzzExtractAndStripProject.
-func extractAndStripProject(b []byte) (project string, stripped []byte, removed, malformed, badProject bool) {
-	// Hot-path prefilter: most datagrams in single-tenant deployments don't
-	// carry the field. bytes.IndexByte-driven Contains keeps this zero-alloc.
-	if !bytes.Contains(b, projectKeyMarker) {
-		return "", b, false, false, false
+// extractAndStripFields is the shared implementation. withToken selects the
+// two-field scan; false reproduces the original `_project`-only behavior byte
+// for byte, including leaving a `_token` member in place.
+func extractAndStripFields(b []byte, withToken bool) routingFields {
+	miss := routingFields{stripped: b}
+	// Hot-path prefilter: most datagrams in single-tenant deployments carry
+	// neither field. bytes.IndexByte-driven Contains keeps this zero-alloc.
+	// Both markers are checked because either one alone requires the scan.
+	if !bytes.Contains(b, projectKeyMarker) &&
+		!(withToken && bytes.Contains(b, tokenKeyMarker)) {
+		return miss
 	}
 
 	i := scanWS(b, 0)
 	if i >= len(b) {
-		return "", b, false, true, false
+		return routingFields{stripped: b, malformed: true}
 	}
 	if b[i] != '{' {
 		// Not an object — caller's validator will drop with parse_error
 		// regardless, so don't double-count here.
-		return "", b, false, false, false
+		return miss
 	}
 	i++
 
@@ -787,36 +1073,43 @@ func extractAndStripProject(b []byte) (project string, stripped []byte, removed,
 	var hits []span
 	idx := 0
 
+	var (
+		project    string
+		token      string
+		badProject bool
+		badToken   bool
+	)
+
 	// Empty-object short-circuit. Without this the loop would fail on the
 	// missing `"` of the (nonexistent) first key and return malformed.
 	// Trailing commas like {"a":1,} are still rejected because the
 	// post-comma branch falls back into the loop's key-quote check.
 	i = scanWS(b, i)
 	if i >= len(b) {
-		return "", b, false, true, false
+		return routingFields{stripped: b, malformed: true}
 	}
 	if b[i] == '}' {
-		return "", b, false, false, false
+		return miss
 	}
 
 	for {
 		// Key.
 		i = scanWS(b, i)
 		if i >= len(b) || b[i] != '"' {
-			return "", b, false, true, false
+			return routingFields{stripped: b, malformed: true}
 		}
 		keyStart := i
 		keyContentStart := i + 1
 		keyContentEnd, ok := scanStringBody(b, keyContentStart)
 		if !ok {
-			return "", b, false, true, false
+			return routingFields{stripped: b, malformed: true}
 		}
 		i = keyContentEnd + 1 // past closing quote
 
 		// Colon.
 		i = scanWS(b, i)
 		if i >= len(b) || b[i] != ':' {
-			return "", b, false, true, false
+			return routingFields{stripped: b, malformed: true}
 		}
 		i++
 
@@ -825,7 +1118,7 @@ func extractAndStripProject(b []byte) (project string, stripped []byte, removed,
 		valStart := i
 		valEnd, valKind, ok := scanValue(b, i)
 		if !ok {
-			return "", b, false, true, false
+			return routingFields{stripped: b, malformed: true}
 		}
 		i = valEnd
 
@@ -835,8 +1128,10 @@ func extractAndStripProject(b []byte) (project string, stripped []byte, removed,
 		// rejected such inputs before reaching the scanner — so behavior
 		// is consistent with the pre-scanner code path (which never
 		// entered the json.Decoder either).
-		if keyContentEnd-keyContentStart == len(projectKey) &&
-			bytes.Equal(b[keyContentStart:keyContentEnd], projectKeyBytes) {
+		keyLen := keyContentEnd - keyContentStart
+		switch {
+		case keyLen == len(projectKey) &&
+			bytes.Equal(b[keyContentStart:keyContentEnd], projectKeyBytes):
 			hits = append(hits, span{keyStart: keyStart, valEnd: valEnd, idx: idx})
 			// Last-wins for both project name and badProject — reset each
 			// iteration so a string-typed later occurrence overrides an
@@ -850,13 +1145,29 @@ func extractAndStripProject(b []byte) (project string, stripped []byte, removed,
 					badProject = false
 				}
 			}
+		case withToken && keyLen == len(tokenKey) &&
+			bytes.Equal(b[keyContentStart:keyContentEnd], tokenKeyBytes):
+			// Stripped on the SAME terms as `_project`, and unconditionally:
+			// a non-string or otherwise unusable `_token` still must not
+			// reach stored telemetry. Only the routing intent is discarded,
+			// never the removal.
+			hits = append(hits, span{keyStart: keyStart, valEnd: valEnd, idx: idx})
+			token = ""
+			badToken = true
+			if valKind == kindString {
+				tv, tvOK := unquoteJSONString(b[valStart:valEnd])
+				if tvOK {
+					token = tv
+					badToken = false
+				}
+			}
 		}
 		idx++
 
 		// Separator or end.
 		i = scanWS(b, i)
 		if i >= len(b) {
-			return "", b, false, true, false
+			return routingFields{stripped: b, malformed: true}
 		}
 		if b[i] == ',' {
 			i++
@@ -865,26 +1176,45 @@ func extractAndStripProject(b []byte) (project string, stripped []byte, removed,
 		if b[i] == '}' {
 			break
 		}
-		return "", b, false, true, false
+		return routingFields{stripped: b, malformed: true}
 	}
 
 	total := idx
 	if len(hits) == 0 {
-		return "", b, false, false, false
+		return miss
+	}
+	result := routingFields{
+		project:    project,
+		token:      token,
+		removed:    true,
+		badProject: badProject,
+		badToken:   badToken,
 	}
 	if len(hits) == total {
-		// All members were `_project`. Result is the empty object.
-		return project, []byte("{}"), true, false, badProject
+		// Every member was a routing field. Result is the empty object.
+		result.stripped = []byte("{}")
+		return result
 	}
 
 	// Splice out each hit, extending the cut to absorb exactly one
 	// separating comma per removed member so the surviving object stays
-	// well-formed. A first-position member owns the comma after its value;
-	// any other position owns the comma before its key.
+	// well-formed.
+	//
+	// A member owns the comma AFTER it when no surviving member precedes it,
+	// and the comma BEFORE it otherwise. Since hits are in ascending member
+	// order, "no survivor before me" is exactly `h.idx == k` — the hit is
+	// still inside the leading run of removed members.
+	//
+	// 🛑 THE CONDITION IS `h.idx == k`, NOT `h.idx == 0`. With one removal the
+	// two agree, which is why the original held. With two ADJACENT removals at
+	// the head, `h.idx == 0` makes the first claim the comma between them and
+	// the second claim that same comma again — nothing absorbs the separator
+	// after the run, and the object comes back as `{,"a":1}`. That was already
+	// reachable before `_token` existed, via duplicate `_project` keys.
 	type cut struct{ start, end int }
 	cuts := make([]cut, 0, len(hits))
-	for _, h := range hits {
-		if h.idx == 0 {
+	for k, h := range hits {
+		if h.idx == k {
 			end := h.valEnd
 			for end < len(b) && isJSONSpace(b[end]) {
 				end++
@@ -914,7 +1244,8 @@ func extractAndStripProject(b []byte) (project string, stripped []byte, removed,
 		pos = c.end
 	}
 	out = append(out, b[pos:]...)
-	return project, out, true, false, badProject
+	result.stripped = out
+	return result
 }
 
 // scanWS advances past JSON whitespace and returns the next non-space offset.

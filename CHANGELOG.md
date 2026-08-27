@@ -4,6 +4,42 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- **Added: inline per-datagram credentials (`_token`).** A datagram may carry
+  a top-level `_token`, which becomes the `Authorization: Bearer` header for
+  the batch its events land in. This exists for deployments where the emitter
+  mints its own short-lived instance token instead of an operator publishing a
+  keys file — mesh0's admission layer already accepts a non-`m0_` bearer as an
+  open-mode instance token, so the agent only has to carry it. An unknown
+  project that arrives with a token is **registered on demand**: there is
+  nothing to declare up front, the token's own claim names the project
+  server-side, and without on-demand registration a keys-less deployment routes
+  nothing at all — observed in production as an agent holding an empty routing
+  table while the emitter had already migrated off the keys file and every
+  datagram dropped as `unrouted_unknown_project`. Controlled by
+  `MESH0_INLINE_TOKENS` (default on; a no-op for deployments that never send
+  the field) and bounded by `MESH0_INLINE_IDLE_MS` (default 15m) plus the
+  existing `MESH0_MAX_PROJECTS`. Keys-file pipelines are never expired.
+  New counters: `drops.bad_token`, and `inline_projects_{registered,expired,live}`
+  in `/stats`.
+
+- **Security: `_token` is always stripped from the event body**, including when
+  `MESH0_INLINE_TOKENS=0` and when the value is not a string. A credential left
+  in the payload is written into stored telemetry and readable by anyone who can
+  later read the event back. Honoring the credential is configurable; removing
+  it is not. A non-string `_token` drops the datagram as `drops.bad_token`
+  rather than falling back to the keys-file credential — a caller that meant to
+  authenticate as one project must not be quietly authorized as another.
+
+- **Fixed: two adjacent stripped members at the head of an object produced
+  invalid JSON.** Comma ownership was decided per hit with `idx == 0` ("the
+  first member owns the comma after it"), which is correct for a single
+  removal but makes two adjacent removals at the head both claim the comma
+  between them — nothing absorbs the separator after the run, and the body
+  comes back as `{,"a":1}`, which the batcher then drops as a parse error. The
+  rule is now "own the comma after you when no surviving member precedes you",
+  i.e. `h.idx == k` over the hit list. This was already reachable before
+  `_token` existed, via duplicate top-level `_project` keys.
+
 - **Changed: `MESH0_MAX_PROJECTS` now defaults to `0` (unlimited), and `0` is
   an accepted value.** The previous default of `64` rejected the *entire*
   keys file whenever a deployment legitimately exceeded it, so the agent

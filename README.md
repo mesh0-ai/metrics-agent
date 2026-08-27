@@ -199,6 +199,8 @@ All knobs are environment variables.
 | `MESH0_SHUTDOWN_GRACE_MS` | `15000`                | Max wait for in-flight flushes on exit.    |
 | `MESH0_KEYS_POLL_MS`      | `30000`                | How often the agent re-reads `MESH0_KEYS_FILE` on its own, independent of `SIGHUP`. Range `[0, 3600000]`; `0` disables polling (SIGHUP-only). Unchanged contents are a quiet no-op. Needed on Kubernetes, where Secret volume updates propagate asynchronously and an externally-sent `SIGHUP` can race the mount. Ignored when `MESH0_KEYS_FILE` is unset. |
 | `MESH0_MAX_PROJECTS`      | `0` (unlimited)        | Cap on registered pipelines (incl. `_default`). Range `[0, 4096]`; **`0` disables the cap** and is the default. Each pipeline costs two goroutines, an `http.Client`, and a 16-slot handoff buffer (`16 × MAX_EVENT_BYTES` worst case), so a cap guards against a misconfigured keys file with one entry per request-id. It is **off by default because the failure mode is all-or-nothing**: a keys file is written wholesale by a control plane, so a legitimate file that exceeds the cap has its *entire* contents rejected and the agent routes nothing at all — `install` fails fast, and a reload is rejected, keeps the previous table, and bumps `keys_reload_failures`. Set a positive value only if you want that guard and have sized it against your own keys file. |
+| `MESH0_INLINE_TOKENS`     | `true`                 | Honor a per-datagram `_token` credential: it authorizes that datagram's batch, and a project seen only via such a datagram is registered on demand without a keys-file entry. Default-on is a no-op for deployments that never send the field, and a project can only be auto-registered by a caller that presented a credential for it. Set `0` to refuse inline credentials — the field is still stripped from the body. When enabled, neither `MESH0_API_KEY` nor `MESH0_KEYS_FILE` is required at startup. See [Inline credentials](#inline-credentials-_token). |
+| `MESH0_INLINE_IDLE_MS`    | `900000` (15m)         | Retire an on-demand `_token` pipeline after this long without traffic. Range `[0, 86400000]`; `0` disables expiry. Keys-file pipelines are never expired. Bounds memory for deployments that churn through ephemeral projects, where the population turns over rather than growing — watch `inline_projects_registered` / `inline_projects_expired` / `inline_projects_live` in `/stats`. |
 | `MESH0_REQUIRE_PROJECT`   | `false`                | When set, datagrams arriving without a `_project` field are **not** routed to the `MESH0_API_KEY` fallback — they drop as `unrouted_missing_project`. Recommended for multi-tenant deployments where silently cross-attributing to the default tenant would be a tagging bug. |
 | `MESH0_LOG_LEVEL`         | `info`                 | `debug` \| `info` \| `warn` \| `error`     |
 
@@ -252,7 +254,9 @@ rotation this is the right tradeoff (don't drop events). For
 SIGHUP to cut over immediately at the cost of in-flight batches.
 
 **Tenant identity comes from the `Authorization` header**, not from
-anything in the event body. The agent strips every top-level `_project`
+anything in the event body. With inline credentials that header is derived
+from the datagram's own `_token` (see below), but the rule is unchanged: the
+gateway reads identity from the header, never from the payload. The agent strips every top-level `_project`
 key before forwarding; the gateway must not read tenant identity from
 the event payload.
 
@@ -266,6 +270,8 @@ Routing rules:
 | yes, known          | any                                      | route to matching key                            |
 | yes, unknown        | any                                      | drop, `drops.unrouted_unknown_project`++         |
 | yes, non-string val | any                                      | drop, `drops.unrouted_unknown_project`++         |
+| yes, unknown        | datagram carries `_token`                | **register the project on demand**, authorize the batch with that token |
+| any                 | datagram carries a non-string `_token`   | drop, `drops.bad_token`++                        |
 
 Both env vars may be set simultaneously; file routes take precedence and
 `MESH0_API_KEY` is the fallback for datagrams without `_project`. Project
@@ -275,6 +281,48 @@ internally) and are rejected at load time.
 Project names live only on the UDS wire between caller and sidecar. The
 agent strips `_project` before POSTing so the gateway sees the same
 `CustomEventInput` shape it does today.
+
+### Inline credentials (`_token`)
+
+A datagram may carry its own credential in a top-level `_token` field:
+
+```json
+{"_project": "workspace-42", "_token": "eyJhbGciOiJFZERTQSJ9…", "operation": "…"}
+```
+
+This exists for deployments where the emitter mints its own short-lived
+instance token rather than an operator publishing a keys file. mesh0's
+admission layer already accepts a non-`m0_` bearer as an open-mode instance
+token, so the agent simply forwards it: `_token` becomes the
+`Authorization: Bearer` header for the batch those events land in.
+
+Three properties are load-bearing:
+
+- **`_token` takes precedence over the keys file.** A datagram that carries
+  one is authorized by it even when its project also has a keys-file entry.
+  The keys file remains the credential for datagrams that carry no token, so
+  existing deployments are unaffected — they never send the field.
+- **An unknown project that arrives with a token is registered on demand.**
+  There is nothing to declare up front: the token's own claim names the
+  project server-side, and the first the agent hears of it is the datagram.
+  Without this a keys-less deployment routes nothing at all. On-demand
+  registrations count against `MESH0_MAX_PROJECTS` and are retired after
+  `MESH0_INLINE_IDLE_MS` without traffic; keys-file projects are never
+  expired, because an operator declared those and a quiet project is not a
+  departed one.
+- **`_token` is always stripped from the body, even when inline tokens are
+  disabled and even when the value is unusable.** A credential left in the
+  payload is written into stored telemetry and readable by anyone who can
+  later read the event back. Honoring the credential is configurable;
+  removing it is not.
+
+A `_token` that is present but not a JSON string drops the datagram as
+`drops.bad_token` rather than silently falling back to the keys-file
+credential — a caller that meant to authenticate as one project must not be
+quietly authorized as another.
+
+Set `MESH0_INLINE_TOKENS=0` to refuse inline credentials entirely; the field
+is still stripped.
 
 ## Health & observability
 
@@ -286,7 +334,7 @@ The agent exposes a small HTTP server on `MESH0_HEALTH_ADDR` (default `:8126`):
   ```json
   {
     "events_received":   123456,
-    "events_dropped":    {"parse_error": 12, "queue_full": 3, "oversize": 0, "flush_failed": 0, "shutdown": 0, "routing_closed": 0, "unrouted_missing_project": 0, "unrouted_unknown_project": 0},
+    "events_dropped":    {"parse_error": 12, "queue_full": 3, "oversize": 0, "flush_failed": 0, "shutdown": 0, "routing_closed": 0, "unrouted_missing_project": 0, "unrouted_unknown_project": 0, "bad_token": 0},
     "batches_sent":      247,
     "events_sent":       123087,
     "last_flush_age_ms": 180,

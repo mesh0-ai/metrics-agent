@@ -62,6 +62,21 @@ type Config struct {
 	// rather than silently cross-attributing to whatever tenant owns the
 	// default key.
 	RequireProject bool
+
+	// InlineTokens honors a per-datagram `_token` credential: it authorizes
+	// that datagram's batch, and a project seen only via such a datagram is
+	// registered on demand without a keys-file entry.
+	//
+	// DEFAULT ON, and that is a no-op for existing deployments: a datagram
+	// that carries no `_token` takes exactly the path it took before, and a
+	// project can only be auto-registered by a caller that presented a
+	// credential for it. Set MESH0_INLINE_TOKENS=0 to refuse inline
+	// credentials outright.
+	InlineTokens bool
+	// InlineIdle retires an inline-registered pipeline after this long
+	// without traffic. Keys-file pipelines are never expired — an operator
+	// declared those. 0 disables expiry.
+	InlineIdle time.Duration
 }
 
 func loadConfig() (Config, error) {
@@ -84,6 +99,8 @@ func loadConfig() (Config, error) {
 		LogLevel:         slog.LevelInfo,
 		MaxProjects:      0,
 		KeysPollInterval: 30 * time.Second,
+		InlineTokens:     true,
+		InlineIdle:       15 * time.Minute,
 	}
 	if v := os.Getenv("MESH0_BATCH_WINDOW_MS"); v != "" {
 		ms, err := strconv.Atoi(v)
@@ -144,6 +161,25 @@ func loadConfig() (Config, error) {
 		}
 		c.KeysPollInterval = time.Duration(ms) * time.Millisecond
 	}
+	if v := os.Getenv("MESH0_INLINE_TOKENS"); v != "" {
+		switch v {
+		case "1", "true", "TRUE":
+			c.InlineTokens = true
+		case "0", "false", "FALSE":
+			c.InlineTokens = false
+		default:
+			return c, fmt.Errorf("MESH0_INLINE_TOKENS must be 0|1|true|false")
+		}
+	}
+	if v := os.Getenv("MESH0_INLINE_IDLE_MS"); v != "" {
+		ms, err := strconv.Atoi(v)
+		// 0 disables expiry; the upper bound is a day, past which "idle" has
+		// stopped meaning anything a sidecar's lifetime can observe.
+		if err != nil || ms < 0 || ms > 86_400_000 {
+			return c, fmt.Errorf("MESH0_INLINE_IDLE_MS must be an integer in [0, 86400000]")
+		}
+		c.InlineIdle = time.Duration(ms) * time.Millisecond
+	}
 	if v := os.Getenv("MESH0_REQUIRE_PROJECT"); v != "" {
 		switch v {
 		case "1", "true", "TRUE":
@@ -168,8 +204,12 @@ func loadConfig() (Config, error) {
 			return c, fmt.Errorf("MESH0_LOG_LEVEL must be debug|info|warn|error")
 		}
 	}
-	if c.APIKey == "" && c.KeysFile == "" {
-		return c, errors.New("set MESH0_API_KEY (single-tenant) or MESH0_KEYS_FILE (multi-tenant)")
+	// An inline-token deployment declares nothing up front — the credential
+	// arrives on the datagram — so it legitimately has neither knob set. The
+	// guard still applies when inline tokens are disabled, where having
+	// neither really does mean the agent can authenticate nothing.
+	if c.APIKey == "" && c.KeysFile == "" && !c.InlineTokens {
+		return c, errors.New("set MESH0_API_KEY (single-tenant), MESH0_KEYS_FILE (multi-tenant), or enable MESH0_INLINE_TOKENS")
 	}
 	if c.ListenPath == "" {
 		return c, errors.New("MESH0_LISTEN_PATH is required")
@@ -207,6 +247,8 @@ func main() {
 		"queue_size", cfg.QueueSize,
 		"keys_file", cfg.KeysFile,
 		"keys_poll", cfg.KeysPollInterval,
+		"inline_tokens", cfg.InlineTokens,
+		"inline_idle", cfg.InlineIdle,
 	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -252,6 +294,14 @@ func main() {
 			}
 		}
 	}()
+
+	// Inline-pipeline idle expiry. Only meaningful when inline registration
+	// can happen at all; a keys-file-only deployment never creates one.
+	if cfg.InlineTokens && cfg.InlineIdle > 0 {
+		expiryStop := make(chan struct{})
+		defer close(expiryStop)
+		go reg.runInlineExpiry(cfg.InlineIdle, expiryStop)
+	}
 
 	listenerErr := make(chan error, 1)
 	go func() { listenerErr <- listen(ctx, cfg.ListenPath, cfg.MaxEventBytes+1, reg, log, stats) }()
