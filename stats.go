@@ -38,11 +38,18 @@ type selfStats struct {
 	// and those have different owners — a bad project name is a mis-tagged
 	// caller, a bad token is a broken credential path. Conflating them
 	// would send an operator to the wrong side of the system.
-	DropsBadToken    atomic.Uint64
-	ReadErrors       atomic.Uint64
-	BufferDegraded   atomic.Bool  // kernel rejected the requested SO_RCVBUF
-	ListenerFatal    atomic.Bool  // listener goroutine exited unexpectedly
-	LastEventFlushMs atomic.Int64 // unix-millis of last successful event flush
+	DropsBadToken atomic.Uint64
+	// DropsMissingToken counts datagrams routed to an inline-registered
+	// pipeline while carrying no `_token`. Such a pipeline has no credential
+	// of its own, so there is nothing to authenticate with — distinct from
+	// bad_token (present but unusable) because the remedy differs: this one
+	// says the emitter stopped attaching credentials, not that it attached a
+	// broken one.
+	DropsMissingToken atomic.Uint64
+	ReadErrors        atomic.Uint64
+	BufferDegraded    atomic.Bool  // kernel rejected the requested SO_RCVBUF
+	ListenerFatal     atomic.Bool  // listener goroutine exited unexpectedly
+	LastEventFlushMs  atomic.Int64 // unix-millis of last successful event flush
 
 	startUnix int64
 }
@@ -88,6 +95,7 @@ type dropStats struct {
 	UnroutedMissing uint64 `json:"unrouted_missing_project,omitempty"`
 	UnroutedUnknown uint64 `json:"unrouted_unknown_project,omitempty"`
 	BadToken        uint64 `json:"bad_token,omitempty"`
+	MissingToken    uint64 `json:"missing_token,omitempty"`
 }
 
 // pipelineStats tracks the per-project subset of counters. These count
@@ -106,6 +114,7 @@ type dropStats struct {
 //	+ selfStats.DropsUnroutedMissing
 //	+ selfStats.DropsUnroutedUnknown
 //	+ selfStats.DropsBadToken
+//	+ Σ pipelineStats.DropsMissingToken
 //	(± in-flight races between the listener bump and the pipeline bump)
 //
 // Per-project visibility lets operators attribute drops to a specific
@@ -117,6 +126,7 @@ type pipelineStats struct {
 	DropsParseError    atomic.Uint64
 	DropsQueueFull     atomic.Uint64
 	DropsRoutingClosed atomic.Uint64
+	DropsMissingToken  atomic.Uint64
 	DropsOversize      atomic.Uint64
 	DropsFlushFailed   atomic.Uint64
 	DropsShutdown      atomic.Uint64
@@ -153,6 +163,7 @@ func (s *pipelineStats) snapshot() projectStatsSnapshot {
 			FlushFailed:   s.DropsFlushFailed.Load(),
 			Shutdown:      s.DropsShutdown.Load(),
 			RoutingClosed: s.DropsRoutingClosed.Load(),
+			MissingToken:  s.DropsMissingToken.Load(),
 		},
 		LastFlushAgeMs: ageMs,
 	}
@@ -180,6 +191,7 @@ func (s *selfStats) snapshot() statsSnapshot {
 			UnroutedMissing: s.DropsUnroutedMissing.Load(),
 			UnroutedUnknown: s.DropsUnroutedUnknown.Load(),
 			BadToken:        s.DropsBadToken.Load(),
+			MissingToken:    s.DropsMissingToken.Load(),
 		},
 		BatchesSent:    s.BatchesSent.Load(),
 		EventsSent:     s.EventsSent.Load(),

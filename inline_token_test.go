@@ -639,3 +639,57 @@ func TestEndToEnd_KeylessInstanceRoutesOnInlineToken(t *testing.T) {
 	cancel()
 	<-listenErr
 }
+
+func TestDispatch_InlinePipelineRejectsUncredentialedDatagram(t *testing.T) {
+	// An emitter that normally attaches `_token` still emits without one when
+	// its own minting fails. The project stays registered from earlier
+	// traffic, and an inline pipeline has no credential of its own — so this
+	// must drop attributably rather than POST an empty bearer.
+	reg, stats := newInlineRegistry(t, inlineConfig())
+
+	if ok, _ := reg.dispatch(rawDatagram{
+		bytes: []byte(`{"_project":"p","_token":"t","a":1}`), at: time.Now(),
+	}); !ok {
+		t.Fatal("first dispatch refused")
+	}
+	p, _ := reg.lookup("p")
+
+	ok, _ := reg.dispatch(rawDatagram{
+		bytes: []byte(`{"_project":"p","a":2}`), at: time.Now(),
+	})
+	if ok {
+		t.Error("delivered an uncredentialed datagram to an inline pipeline")
+	}
+	if stats.DropsMissingToken.Load() != 1 {
+		t.Errorf("missing_token: got %d, want 1", stats.DropsMissingToken.Load())
+	}
+	if p.stats.DropsMissingToken.Load() != 1 {
+		t.Errorf("per-pipeline missing_token: got %d, want 1", p.stats.DropsMissingToken.Load())
+	}
+	// Not conflated with a credential that was present but malformed.
+	if stats.DropsBadToken.Load() != 0 {
+		t.Errorf("bad_token: got %d, want 0", stats.DropsBadToken.Load())
+	}
+}
+
+func TestDispatch_KeysFilePipelineStillAcceptsUncredentialedDatagram(t *testing.T) {
+	// The new guard must apply ONLY to inline pipelines — a declared project
+	// authenticates from the keys file and never needed a datagram credential.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keys.json")
+	if err := os.WriteFile(path, []byte(`{"declared":"m0_a"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := inlineConfig()
+	cfg.KeysFile = path
+	reg, stats := newInlineRegistry(t, cfg)
+
+	if ok, _ := reg.dispatch(rawDatagram{
+		bytes: []byte(`{"_project":"declared","a":1}`), at: time.Now(),
+	}); !ok {
+		t.Fatal("keys-file pipeline refused an uncredentialed datagram")
+	}
+	if stats.DropsMissingToken.Load() != 0 {
+		t.Errorf("missing_token: got %d, want 0", stats.DropsMissingToken.Load())
+	}
+}

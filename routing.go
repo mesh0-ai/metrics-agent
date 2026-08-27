@@ -579,6 +579,21 @@ func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
 		}
 		return false, false
 	}
+	// An inline pipeline holds no credential of its own (see registerInline),
+	// so a datagram that routes there without carrying one cannot be
+	// authenticated at all. Drop it here rather than letting the batcher
+	// assemble events the flusher would POST under an empty bearer — that
+	// spends a whole batch to earn a 401, and accounts as flush_failed, which
+	// points an operator at the gateway instead of at the emitter.
+	//
+	// Reachable in practice: an emitter that normally sends `_token` still
+	// emits without one when its own minting fails, and the project stays
+	// registered from earlier traffic.
+	if p.inline && dg.token == "" {
+		p.stats.DropsMissingToken.Add(1)
+		r.processStats.DropsMissingToken.Add(1)
+		return false, false
+	}
 	p.lastSeen.Store(dg.at.UnixNano())
 	// Early closed-pipeline check. If the pipeline was already drained at
 	// dispatch time (pre-drain in tests, or a reload that retired the

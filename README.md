@@ -272,6 +272,7 @@ Routing rules:
 | yes, non-string val | any                                      | drop, `drops.unrouted_unknown_project`++         |
 | yes, unknown        | datagram carries `_token`                | **register the project on demand**, authorize the batch with that token |
 | any                 | datagram carries a non-string `_token`   | drop, `drops.bad_token`++                        |
+| yes, inline-registered | datagram carries no `_token`          | drop, `drops.missing_token`++                    |
 
 Both env vars may be set simultaneously; file routes take precedence and
 `MESH0_API_KEY` is the fallback for datagrams without `_project`. Project
@@ -321,6 +322,14 @@ A `_token` that is present but not a JSON string drops the datagram as
 credential — a caller that meant to authenticate as one project must not be
 quietly authorized as another.
 
+An on-demand pipeline holds no credential of its own, so a datagram routed to
+one **without** a `_token` drops as `drops.missing_token`. This is reachable
+whenever an emitter that normally attaches a credential fails to mint one: the
+project stays registered from earlier traffic, and the alternative would be to
+batch those events and POST them under an empty bearer — spending a full batch
+to earn a 401 that reads like a gateway problem rather than an emitter one.
+Keys-file projects are unaffected; they authenticate from the file.
+
 Set `MESH0_INLINE_TOKENS=0` to refuse inline credentials entirely; the field
 is still stripped.
 
@@ -334,7 +343,7 @@ The agent exposes a small HTTP server on `MESH0_HEALTH_ADDR` (default `:8126`):
   ```json
   {
     "events_received":   123456,
-    "events_dropped":    {"parse_error": 12, "queue_full": 3, "oversize": 0, "flush_failed": 0, "shutdown": 0, "routing_closed": 0, "unrouted_missing_project": 0, "unrouted_unknown_project": 0, "bad_token": 0},
+    "events_dropped":    {"parse_error": 12, "queue_full": 3, "oversize": 0, "flush_failed": 0, "shutdown": 0, "routing_closed": 0, "unrouted_missing_project": 0, "unrouted_unknown_project": 0, "bad_token": 0, "missing_token": 0},
     "batches_sent":      247,
     "events_sent":       123087,
     "last_flush_age_ms": 180,

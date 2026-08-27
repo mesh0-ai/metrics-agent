@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## Unreleased
+## 0.4.0
 
 - **Added: inline per-datagram credentials (`_token`).** A datagram may carry
   a top-level `_token`, which becomes the `Authorization: Bearer` header for
@@ -19,8 +19,15 @@ All notable changes to this project are documented here.
   `MESH0_INLINE_TOKENS` (default on; a no-op for deployments that never send
   the field) and bounded by `MESH0_INLINE_IDLE_MS` (default 15m) plus the
   existing `MESH0_MAX_PROJECTS`. Keys-file pipelines are never expired.
-  New counters: `drops.bad_token`, and `inline_projects_{registered,expired,live}`
-  in `/stats`.
+  New counters: `drops.bad_token`, `drops.missing_token`, and
+  `inline_projects_{registered,expired,live}` in `/stats`.
+
+  A datagram routed to an on-demand pipeline **without** a `_token` drops as
+  `drops.missing_token` rather than being batched and POSTed under an empty
+  bearer. Such a pipeline holds no credential of its own, and the case is
+  reachable whenever an emitter that normally attaches one fails to mint it —
+  batching those events would spend a full batch to earn a 401 that reads like
+  a gateway fault instead of an emitter fault.
 
 - **Security: `_token` is always stripped from the event body**, including when
   `MESH0_INLINE_TOKENS=0` and when the value is not a string. A credential left
