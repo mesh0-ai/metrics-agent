@@ -9,18 +9,17 @@ import (
 
 // loadConfig is the single chokepoint for env-driven validation, so a
 // regression here can only surface at deploy time. Table-driven coverage
-// for each env var's range and the cross-cutting "API key required" check.
+// for each env var's range.
+//
+// There is no "credential required" check any more: routing is `_token`-only,
+// so a correct deployment declares NO credential up front.
 
 func TestLoadConfigDefaults(t *testing.T) {
 	clearMesh0Env(t)
-	t.Setenv("MESH0_API_KEY", "secret")
 
 	cfg, err := loadConfig()
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
-	}
-	if cfg.APIKey != "secret" {
-		t.Errorf("APIKey: got %q", cfg.APIKey)
 	}
 	if cfg.GatewayURL != "https://api.mesh0.ai" {
 		t.Errorf("GatewayURL default: got %q", cfg.GatewayURL)
@@ -49,12 +48,8 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.ShutdownGrace != 15*time.Second {
 		t.Errorf("ShutdownGrace default: got %v", cfg.ShutdownGrace)
 	}
-	if cfg.KeysPollInterval != 30*time.Second {
-		t.Errorf("KeysPollInterval default: got %v", cfg.KeysPollInterval)
-	}
-	// 0 = unlimited. A keys file is written wholesale by a control plane, so
-	// a cap that a legitimate file exceeds rejects the WHOLE file and routes
-	// nothing — a worse failure than the memory growth it guards against.
+	// 0 = unlimited. Every pipeline is registered on demand from a valid
+	// `_token`, so a cap only ever fires on a misbehaving emitter.
 	if cfg.MaxProjects != 0 {
 		t.Errorf("MaxProjects default: got %d, want 0 (unlimited)", cfg.MaxProjects)
 	}
@@ -63,28 +58,31 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 }
 
-func TestLoadConfigRequiresAPIKeyWhenInlineDisabled(t *testing.T) {
-	// The guard now applies only when inline tokens are off. With them on
-	// (the default) a deployment legitimately declares no credential up
-	// front — it arrives on the datagram.
-	clearMesh0Env(t)
-	t.Setenv("MESH0_INLINE_TOKENS", "0")
-	if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "MESH0_API_KEY") {
-		t.Fatalf("expected MESH0_API_KEY required error, got %v", err)
-	}
-}
-
-func TestLoadConfigAllowsNoCredentialWhenInlineEnabled(t *testing.T) {
+// A bare environment is a VALID configuration: the credential arrives on the
+// datagram, so there is nothing to declare. This used to be an error.
+func TestLoadConfigNeedsNoCredentialUpFront(t *testing.T) {
 	clearMesh0Env(t)
 	cfg, err := loadConfig()
 	if err != nil {
-		t.Fatalf("loadConfig: %v", err)
-	}
-	if !cfg.InlineTokens {
-		t.Fatalf("InlineTokens default: got false, want true")
+		t.Fatalf("loadConfig with no credential env: %v", err)
 	}
 	if cfg.InlineIdle != 15*time.Minute {
 		t.Errorf("InlineIdle default: got %v, want 15m", cfg.InlineIdle)
+	}
+}
+
+// Retired knobs must not fail the process. A chart that still sets
+// MESH0_KEYS_FILE during the rollout that removes it has to keep booting --
+// warnRetiredEnv logs it instead.
+func TestLoadConfigIgnoresRetiredCredentialEnv(t *testing.T) {
+	for _, k := range retiredEnv {
+		t.Run(k, func(t *testing.T) {
+			clearMesh0Env(t)
+			t.Setenv(k, "1")
+			if _, err := loadConfig(); err != nil {
+				t.Fatalf("retired %s must be ignored, not fatal: %v", k, err)
+			}
+		})
 	}
 }
 
@@ -107,21 +105,6 @@ func TestLoadConfigInlineIdleRange(t *testing.T) {
 	}
 	if cfg.InlineIdle != 0 {
 		t.Errorf("InlineIdle: got %v, want 0", cfg.InlineIdle)
-	}
-}
-
-func TestLoadConfigAcceptsKeysFileWithoutAPIKey(t *testing.T) {
-	clearMesh0Env(t)
-	t.Setenv("MESH0_KEYS_FILE", "/some/path.json")
-	cfg, err := loadConfig()
-	if err != nil {
-		t.Fatalf("loadConfig: %v", err)
-	}
-	if cfg.KeysFile != "/some/path.json" {
-		t.Errorf("KeysFile: got %q", cfg.KeysFile)
-	}
-	if cfg.APIKey != "" {
-		t.Errorf("APIKey: got %q", cfg.APIKey)
 	}
 }
 
@@ -298,34 +281,6 @@ func TestLoadConfigValidationRanges(t *testing.T) {
 			name: "log_level invalid rejected",
 			env:  map[string]string{"MESH0_LOG_LEVEL": "trace"},
 			want: "MESH0_LOG_LEVEL",
-		},
-		{
-			name: "keys_poll zero disables",
-			env:  map[string]string{"MESH0_KEYS_POLL_MS": "0"},
-			assert: func(t *testing.T, c Config) {
-				if c.KeysPollInterval != 0 {
-					t.Errorf("KeysPollInterval: got %v", c.KeysPollInterval)
-				}
-			},
-		},
-		{
-			name: "keys_poll valid",
-			env:  map[string]string{"MESH0_KEYS_POLL_MS": "5000"},
-			assert: func(t *testing.T, c Config) {
-				if c.KeysPollInterval != 5*time.Second {
-					t.Errorf("KeysPollInterval: got %v", c.KeysPollInterval)
-				}
-			},
-		},
-		{
-			name: "keys_poll negative rejected",
-			env:  map[string]string{"MESH0_KEYS_POLL_MS": "-1"},
-			want: "MESH0_KEYS_POLL_MS",
-		},
-		{
-			name: "keys_poll over ceiling rejected",
-			env:  map[string]string{"MESH0_KEYS_POLL_MS": "3600001"},
-			want: "MESH0_KEYS_POLL_MS",
 		},
 		{
 			name: "gateway and events path overrides",

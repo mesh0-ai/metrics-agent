@@ -3,22 +3,21 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 )
 
+// inlineConfig is now just testConfig -- inline tokens are the only mode.
+// Kept as a named seam so the inline-specific tests still read clearly.
 func inlineConfig() Config {
-	c := testConfig()
-	c.InlineTokens = true
-	return c
+	return testConfig()
 }
 
 func newInlineRegistry(t *testing.T, cfg Config) (*registry, *selfStats) {
@@ -146,16 +145,9 @@ func TestExtractAndStripProject_LeavesTokenAlone(t *testing.T) {
 // ---- dispatch -------------------------------------------------------------
 
 func TestDispatch_RegistersProjectFromInlineToken(t *testing.T) {
-	// The whole point: an empty keys file, a project nobody declared, and a
-	// datagram that carries its own credential.
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(path, []byte(`{}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := inlineConfig()
-	cfg.KeysFile = path
-	reg, stats := newInlineRegistry(t, cfg)
+	// The whole point: nothing declared anywhere, and a datagram that carries
+	// its own credential.
+	reg, stats := newInlineRegistry(t, inlineConfig())
 
 	ok, _ := reg.dispatch(rawDatagram{
 		bytes: []byte(`{"_project":"workspace-10","_token":"eyJ.tok","a":1}`),
@@ -171,12 +163,6 @@ func TestDispatch_RegistersProjectFromInlineToken(t *testing.T) {
 	if !found {
 		t.Fatal("pipeline was not registered")
 	}
-	if !p.inline {
-		t.Error("pipeline not marked inline")
-	}
-	if p.apiKey != "" {
-		t.Errorf("inline pipeline holds a fallback key %q; it must authenticate per batch", p.apiKey)
-	}
 	if reg.InlineProjectsRegistered.Load() != 1 {
 		t.Errorf("registered counter: got %d", reg.InlineProjectsRegistered.Load())
 	}
@@ -185,47 +171,20 @@ func TestDispatch_RegistersProjectFromInlineToken(t *testing.T) {
 	})
 }
 
-func TestDispatch_InlineDisabledLeavesProjectUnrouted(t *testing.T) {
-	cfg := testConfig() // InlineTokens false
-	cfg.APIKey = "m0_default"
-	reg, stats := newInlineRegistry(t, cfg)
-
-	reg.dispatch(rawDatagram{
-		bytes: []byte(`{"_project":"workspace-10","_token":"eyJ.tok"}`),
-		at:    time.Now(),
-	})
-	if _, found := reg.lookup("workspace-10"); found {
-		t.Error("registered a pipeline with inline tokens disabled")
-	}
-	if stats.DropsUnroutedUnknown.Load() != 1 {
-		t.Errorf("unrouted_unknown: got %d, want 1", stats.DropsUnroutedUnknown.Load())
-	}
-}
-
-func TestDispatch_TokenStrippedEvenWhenInlineDisabled(t *testing.T) {
-	// Honoring the credential is optional; keeping it out of stored telemetry
-	// is not.
-	cfg := testConfig() // InlineTokens false
-	cfg.APIKey = "m0_default"
-	reg, _ := newInlineRegistry(t, cfg)
-
-	reg.dispatch(rawDatagram{bytes: []byte(`{"_token":"secret-jwt","a":1}`), at: time.Now()})
-	p, _ := reg.lookup("")
-	waitFor(t, "datagram to reach the default pipeline", func() bool {
-		return p.stats.EventsReceived.Load() == 1
-	})
-	// The body handed on must not contain the credential; assert on the
-	// extraction the dispatch performed.
-	f := extractAndStripRouting([]byte(`{"_token":"secret-jwt","a":1}`))
+// Keeping the credential out of stored telemetry is not optional, whatever
+// else happens to the datagram.
+func TestDispatch_TokenIsStrippedFromTheBody(t *testing.T) {
+	f := extractAndStripRouting([]byte(`{"_project":"ws","_token":"secret-jwt","a":1}`))
 	if string(f.stripped) != `{"a":1}` {
 		t.Errorf("token not stripped: %s", f.stripped)
+	}
+	if f.token != "secret-jwt" {
+		t.Errorf("token: got %q", f.token)
 	}
 }
 
 func TestDispatch_BadTokenIsItsOwnDrop(t *testing.T) {
-	cfg := inlineConfig()
-	cfg.APIKey = "m0_default"
-	reg, stats := newInlineRegistry(t, cfg)
+	reg, stats := newInlineRegistry(t, inlineConfig())
 
 	reg.dispatch(rawDatagram{bytes: []byte(`{"_token":99,"a":1}`), at: time.Now()})
 	if stats.DropsBadToken.Load() != 1 {
@@ -237,30 +196,12 @@ func TestDispatch_BadTokenIsItsOwnDrop(t *testing.T) {
 	}
 }
 
-func TestDispatch_BadTokenIsNotDowngradedToTheKeysFileKey(t *testing.T) {
-	// A caller that meant to authenticate with a token and got the type wrong
-	// must not be quietly authorized as whoever owns the default key.
-	cfg := inlineConfig()
-	cfg.APIKey = "m0_default"
-	reg, _ := newInlineRegistry(t, cfg)
-
-	ok, _ := reg.dispatch(rawDatagram{bytes: []byte(`{"_token":{},"a":1}`), at: time.Now()})
-	if ok {
-		t.Error("dispatch delivered a datagram with an unusable credential")
-	}
-	p, _ := reg.lookup("")
-	if p.stats.EventsReceived.Load() != 0 {
-		t.Errorf("default pipeline received %d events", p.stats.EventsReceived.Load())
-	}
-}
-
 func TestDispatch_MaxProjectsBoundsInlineRegistration(t *testing.T) {
 	cfg := inlineConfig()
-	cfg.APIKey = "m0_default" // occupies one slot
-	cfg.MaxProjects = 2
+	cfg.MaxProjects = 1
 	reg, stats := newInlineRegistry(t, cfg)
 
-	// First inline project fits (default + one).
+	// The table starts empty, so the first project fits.
 	if ok, _ := reg.dispatch(rawDatagram{
 		bytes: []byte(`{"_project":"p1","_token":"t"}`), at: time.Now(),
 	}); !ok {
@@ -304,31 +245,9 @@ func TestDispatch_ConcurrentFirstSightingRegistersOnce(t *testing.T) {
 	}
 }
 
-// ---- precedence -----------------------------------------------------------
+// ---- credential ------------------------------------------------------------
 
-func TestFlusher_InlineTokenBeatsTheConfiguredKey(t *testing.T) {
-	var got string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = r.Header.Get("Authorization")
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	f, _ := newTestEventsFlusher(t, srv.URL, 0) // configured with APIKey "k"
-	in := make(chan EventBatch, 1)
-	f.in = in
-	batch := sampleEventBatch(1)
-	batch.Token = "eyJ.inline"
-	in <- batch
-	close(in)
-	f.run()
-
-	if got != "Bearer eyJ.inline" {
-		t.Errorf("Authorization: got %q, want the inline token", got)
-	}
-}
-
-func TestFlusher_FallsBackToConfiguredKeyWithoutAToken(t *testing.T) {
+func TestFlusher_AuthorizesTheBatchWithItsOwnToken(t *testing.T) {
 	var got string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = r.Header.Get("Authorization")
@@ -339,12 +258,14 @@ func TestFlusher_FallsBackToConfiguredKeyWithoutAToken(t *testing.T) {
 	f, _ := newTestEventsFlusher(t, srv.URL, 0)
 	in := make(chan EventBatch, 1)
 	f.in = in
-	in <- sampleEventBatch(1) // no Token
+	batch := sampleEventBatch(1)
+	batch.Token = "eyJ.inline"
+	in <- batch
 	close(in)
 	f.run()
 
-	if got != "Bearer k" {
-		t.Errorf("Authorization: got %q, want the configured key", got)
+	if got != "Bearer eyJ.inline" {
+		t.Errorf("Authorization: got %q, want the inline token", got)
 	}
 }
 
@@ -374,19 +295,14 @@ func TestBatcher_CarriesTheFreshestToken(t *testing.T) {
 
 // ---- idle expiry ----------------------------------------------------------
 
-func TestExpireInline_RetiresIdleInlineOnly(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(path, []byte(`{"declared":"m0_a"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := inlineConfig()
-	cfg.KeysFile = path
-	reg, _ := newInlineRegistry(t, cfg)
+// Idle expiry is now the ONLY thing that removes a pipeline, so it is the
+// only thing bounding the population.
+func TestExpireInline_RetiresIdlePipelines(t *testing.T) {
+	reg, _ := newInlineRegistry(t, inlineConfig())
 
 	reg.dispatch(rawDatagram{bytes: []byte(`{"_project":"ephemeral","_token":"t"}`), at: time.Now()})
 	if _, found := reg.lookup("ephemeral"); !found {
-		t.Fatal("inline project not registered")
+		t.Fatal("project not registered")
 	}
 
 	// Everything is idle relative to a future clock.
@@ -395,11 +311,7 @@ func TestExpireInline_RetiresIdleInlineOnly(t *testing.T) {
 		t.Errorf("retired: got %d, want 1", n)
 	}
 	if _, found := reg.lookup("ephemeral"); found {
-		t.Error("idle inline pipeline still routable")
-	}
-	// A declared project is an operator's statement, not a guess about traffic.
-	if _, found := reg.lookup("declared"); !found {
-		t.Error("keys-file pipeline was expired")
+		t.Error("idle pipeline still routable")
 	}
 	waitFor(t, "expiry counter", func() bool {
 		return reg.InlineProjectsExpired.Load() == 1
@@ -531,11 +443,10 @@ func FuzzExtractAndStripRouting(f *testing.F) {
 }
 
 // TestEndToEnd_KeylessInstanceRoutesOnInlineToken is the production scenario
-// this feature exists for, wired end to end: an agent started with an EMPTY
-// keys file (the shape a control plane leaves behind after migrating its
-// emitter to inline credentials), a datagram arriving over the real UDS
-// socket naming a project nobody declared and carrying its own token, and a
-// gateway that must see that token in the Authorization header.
+// this exists for, wired end to end: an agent started with NO credentials at
+// all, a datagram arriving over the real UDS socket naming a project nobody
+// declared and carrying its own token, and a gateway that must see that
+// token in the Authorization header.
 //
 // Before inline credentials this dropped as unrouted_unknown_project with an
 // empty routing table and no route ever installed.
@@ -555,26 +466,19 @@ func TestEndToEnd_KeylessInstanceRoutesOnInlineToken(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	dir := t.TempDir()
-	keys := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(keys, []byte(`{}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	// shortTempSocketPath, not filepath.Join(t.TempDir(), …): sun_path caps
 	// at 103 bytes and a temp-dir path blows past it on macOS.
 	sock := shortTempSocketPath(t)
 
-	cfg := inlineConfig()
+	cfg := inlineConfig() // nothing declared anywhere
 	cfg.GatewayURL = srv.URL
-	cfg.KeysFile = keys
-	cfg.APIKey = "" // nothing declared anywhere
 	cfg.BatchWindow = 20 * time.Millisecond
 
 	stats := newSelfStats()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	reg := newRegistry(cfg, log, stats)
 	if err := reg.install(); err != nil {
-		t.Fatalf("install with an empty keys file: %v", err)
+		t.Fatalf("install with nothing declared: %v", err)
 	}
 	defer reg.shutdown(time.Second)
 
@@ -640,11 +544,11 @@ func TestEndToEnd_KeylessInstanceRoutesOnInlineToken(t *testing.T) {
 	<-listenErr
 }
 
-func TestDispatch_InlinePipelineRejectsUncredentialedDatagram(t *testing.T) {
+func TestDispatch_PipelineRejectsUncredentialedDatagram(t *testing.T) {
 	// An emitter that normally attaches `_token` still emits without one when
 	// its own minting fails. The project stays registered from earlier
-	// traffic, and an inline pipeline has no credential of its own — so this
-	// must drop attributably rather than POST an empty bearer.
+	// traffic, and no pipeline holds a credential of its own — so this must
+	// drop attributably rather than POST an empty bearer.
 	reg, stats := newInlineRegistry(t, inlineConfig())
 
 	if ok, _ := reg.dispatch(rawDatagram{
@@ -658,7 +562,7 @@ func TestDispatch_InlinePipelineRejectsUncredentialedDatagram(t *testing.T) {
 		bytes: []byte(`{"_project":"p","a":2}`), at: time.Now(),
 	})
 	if ok {
-		t.Error("delivered an uncredentialed datagram to an inline pipeline")
+		t.Error("delivered an uncredentialed datagram to a pipeline")
 	}
 	if stats.DropsMissingToken.Load() != 1 {
 		t.Errorf("missing_token: got %d, want 1", stats.DropsMissingToken.Load())
@@ -672,24 +576,66 @@ func TestDispatch_InlinePipelineRejectsUncredentialedDatagram(t *testing.T) {
 	}
 }
 
-func TestDispatch_KeysFilePipelineStillAcceptsUncredentialedDatagram(t *testing.T) {
-	// The new guard must apply ONLY to inline pipelines — a declared project
-	// authenticates from the keys file and never needed a datagram credential.
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(path, []byte(`{"declared":"m0_a"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := inlineConfig()
-	cfg.KeysFile = path
-	reg, stats := newInlineRegistry(t, cfg)
+// ---- the incident this removal fixes ---------------------------------------
 
-	if ok, _ := reg.dispatch(rawDatagram{
-		bytes: []byte(`{"_project":"declared","a":1}`), at: time.Now(),
-	}); !ok {
-		t.Fatal("keys-file pipeline refused an uncredentialed datagram")
+// REGRESSION. The keys-file model rebuilt the whole routing table on every
+// poll (default 30s) from the file's contents, then drained every pipeline
+// that was not in the rebuilt table. Inline `_token` pipelines were never in
+// it -- they are not declared anywhere -- so an agent configured with
+// MESH0_KEYS_FILE pointed at an empty `{}` tore down every live pipeline
+// twice a minute and dropped its buffered batches as `shutdown`.
+//
+// On xano-deriv that was 11.8M dropped events against 28.4M received.
+//
+// The reload path is gone, so this pins the invariant that replaced it:
+// registration is PURELY ADDITIVE. Nothing but idle expiry removes a
+// pipeline, and registering a new project must never disturb an existing one.
+func TestRegistry_RegistrationIsAdditiveAndNeverRetiresLivePipelines(t *testing.T) {
+	reg, stats := newInlineRegistry(t, inlineConfig())
+
+	first, _ := reg.dispatch(rawDatagram{
+		bytes: []byte(`{"_project":"ws-1","_token":"t1","a":1}`), at: time.Now(),
+	})
+	if !first {
+		t.Fatal("first registration refused")
 	}
-	if stats.DropsMissingToken.Load() != 0 {
-		t.Errorf("missing_token: got %d, want 0", stats.DropsMissingToken.Load())
+	p1, _ := reg.lookup("ws-1")
+	waitFor(t, "ws-1 to receive its datagram", func() bool {
+		return p1.stats.EventsReceived.Load() == 1
+	})
+
+	// Register many more projects. Under the old model any table rebuild
+	// between these would have retired ws-1.
+	for i := 2; i <= 25; i++ {
+		n := fmt.Sprintf("ws-%d", i)
+		if ok, _ := reg.dispatch(rawDatagram{
+			bytes: []byte(`{"_project":"` + n + `","_token":"t","a":1}`), at: time.Now(),
+		}); !ok {
+			t.Fatalf("registration of %s refused", n)
+		}
+	}
+
+	// ws-1 is still the SAME pipeline object, still routable, never drained.
+	again, found := reg.lookup("ws-1")
+	if !found {
+		t.Fatal("ws-1 was retired by later registrations")
+	}
+	if again != p1 {
+		t.Error("ws-1 was replaced by a new pipeline; registration must not rebuild the table")
+	}
+	again.sendMu.RLock()
+	closed := again.closed
+	again.sendMu.RUnlock()
+	if closed {
+		t.Error("ws-1 was drained while still live")
+	}
+
+	// And nothing was dropped as shutdown along the way -- the counter that
+	// reached 11.8M in production.
+	if got := stats.DropsShutdown.Load(); got != 0 {
+		t.Errorf("shutdown drops during steady-state registration: got %d, want 0", got)
+	}
+	if got := len(reg.cur.Load().pipelines); got != 25 {
+		t.Errorf("pipelines: got %d, want 25", got)
 	}
 }

@@ -41,14 +41,14 @@ const MaxBatchBytes = 10 * 1024 * 1024
 //
 // project is stamped by the routing layer's dispatch (after _project extraction)
 // so the demuxer goroutine can route the datagram to its pipeline without
-// re-parsing. An empty project means the datagram routes to DefaultProject.
+// re-parsing. An empty project cannot be routed and drops as unrouted.
 type rawDatagram struct {
 	bytes   []byte
 	at      time.Time
 	project string
-	// token is the per-datagram credential recovered from `_token`, empty
-	// when the datagram carried none. Deployments that publish a keys file
-	// leave this empty and authenticate from the pipeline's configured key.
+	// token is the per-datagram credential recovered from `_token`. It is
+	// the only credential the agent has: dispatch drops any datagram that
+	// reaches a pipeline without one, so this is non-empty downstream.
 	token string
 }
 
@@ -58,8 +58,8 @@ type rawDatagram struct {
 type EventBatch struct {
 	Events    []json.RawMessage
 	StartedAt time.Time
-	// Token authorizes THIS batch, when its datagrams carried one. Empty
-	// means "use the flusher's configured key" — the keys-file path.
+	// Token authorizes THIS batch. It is the only credential in play —
+	// there is no configured key to fall back to.
 	//
 	// 🛑 THE CREDENTIAL TRAVELS WITH THE EVENTS IT AUTHORIZES, rather than
 	// being read off the pipeline at POST time. A pipeline's token rotates

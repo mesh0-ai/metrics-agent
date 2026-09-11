@@ -10,8 +10,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -147,8 +145,8 @@ func TestExtractAndStripProject_LiteralInsideNestedKey(t *testing.T) {
 // TestExtractAndStripProject_NonStringValue: `_project` with a non-string
 // value (number, null, object) is well-formed JSON but unusable for routing.
 // The key is still stripped (so the gateway doesn't 400) and badProject=true
-// so dispatch counts it as unrouted_unknown instead of silently falling
-// through to the DefaultProject pipeline.
+// so dispatch counts it as unrouted_unknown instead of being treated as a
+// project name.
 func TestExtractAndStripProject_NonStringValue(t *testing.T) {
 	for _, body := range []string{
 		`{"_project":42,"a":1}`,
@@ -232,81 +230,8 @@ func TestExtractAndStripProject_Malformed(t *testing.T) {
 	}
 }
 
-func TestLoadKeysFile_OK(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	contents := `{"ws-42":"m0_aaa","ws-99":"m0_bbb"}`
-	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	keys, err := loadKeysFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if keys["ws-42"] != "m0_aaa" || keys["ws-99"] != "m0_bbb" {
-		t.Errorf("got %+v", keys)
-	}
-}
-
-func TestLoadKeysFile_RejectsReservedPrefix(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(path, []byte(`{"_default":"m0_x"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := loadKeysFile(path); err == nil {
-		t.Error("expected error for underscore-prefixed project")
-	}
-}
-
-func TestLoadKeysFile_RejectsEmptyKey(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(path, []byte(`{"ws-42":""}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := loadKeysFile(path); err == nil {
-		t.Error("expected error for empty api key")
-	}
-}
-
-func TestRegistry_DispatchLegacyDefault(t *testing.T) {
-	cfg := testConfig()
-	cfg.APIKey = "m0_default"
-	stats := newSelfStats()
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := newRegistry(cfg, log, stats)
-	if err := reg.install(); err != nil {
-		t.Fatal(err)
-	}
-	defer reg.shutdown(0)
-
-	// No _project → routes to _default pipeline.
-	dg := rawDatagram{bytes: []byte(`{"a":1}`), at: time.Now()}
-	ok, _ := reg.dispatch(dg)
-	if !ok {
-		t.Error("expected dispatch=true to default pipeline")
-	}
-	pipe, _ := reg.lookup("")
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if pipe.stats.EventsReceived.Load() == 1 {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("datagram never reached default pipeline (events_received=%d)", pipe.stats.EventsReceived.Load())
-}
-
 func TestRegistry_DispatchMissingProjectWhenMultiTenant(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	cfg := testConfig()
-	cfg.APIKey = "" // multi-tenant only: no default fallback
-	cfg.KeysFile = path
 	stats := newSelfStats()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	reg := newRegistry(cfg, log, stats)
@@ -314,150 +239,29 @@ func TestRegistry_DispatchMissingProjectWhenMultiTenant(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reg.shutdown(0)
+	registerProjects(t, reg, "ws-42")
 
-	// No _project on the wire → missing_project drop.
-	reg.dispatch(rawDatagram{bytes: []byte(`{"a":1}`), at: time.Now()})
+	// No _project on the wire → missing_project drop. There is no default
+	// pipeline to fall through to, credential or not.
+	reg.dispatch(rawDatagram{bytes: []byte(`{"_token":"t","a":1}`), at: time.Now()})
 	if stats.DropsUnroutedMissing.Load() != 1 {
 		t.Errorf("missing: got %d", stats.DropsUnroutedMissing.Load())
 	}
-	// Unknown project → unknown_project drop.
+	// Unknown project with NO credential → unknown_project drop (a token is
+	// what would have registered it).
 	reg.dispatch(rawDatagram{bytes: []byte(`{"_project":"ws-zzz"}`), at: time.Now()})
 	if stats.DropsUnroutedUnknown.Load() != 1 {
 		t.Errorf("unknown: got %d", stats.DropsUnroutedUnknown.Load())
 	}
 	// Known project → delivered.
-	ok, _ := reg.dispatch(rawDatagram{bytes: []byte(`{"_project":"ws-42","a":1}`), at: time.Now()})
+	ok, _ := reg.dispatch(rawDatagram{bytes: []byte(`{"_project":"ws-42","_token":"t","a":1}`), at: time.Now()})
 	if !ok {
 		t.Error("expected dispatch to ws-42")
 	}
 }
 
-func TestRegistry_ReloadAddsAndRemovesProjects(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := testConfig()
-	cfg.APIKey = ""
-	cfg.KeysFile = path
-	cfg.ShutdownGrace = 0
-	stats := newSelfStats()
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := newRegistry(cfg, log, stats)
-	if err := reg.install(); err != nil {
-		t.Fatal(err)
-	}
-	defer reg.shutdown(0)
-
-	if _, ok := reg.lookup("ws-42"); !ok {
-		t.Fatal("ws-42 not registered initially")
-	}
-
-	// Add ws-99, remove ws-42 via reload (atomic rename).
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(`{"ws-99":"m0_b"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		t.Fatal(err)
-	}
-	reg.reload()
-
-	if _, ok := reg.lookup("ws-99"); !ok {
-		t.Error("ws-99 not registered after reload")
-	}
-	if _, ok := reg.lookup("ws-42"); ok {
-		t.Error("ws-42 still registered after removal")
-	}
-}
-
-// TestRegistry_InstallEmptyKeysFile ensures a readable-but-empty keys file
-// starts an empty routing table instead of exiting. On Kubernetes the mesh0
-// Secret is templated as `{}` at deploy time and a reconciler fills it in
-// after the pod starts — failing install turns that provisioning window into
-// a crash loop. A later reload must then install the first routes.
-func TestRegistry_InstallEmptyKeysFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(path, []byte(`{}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := testConfig()
-	cfg.APIKey = ""
-	cfg.KeysFile = path
-	stats := newSelfStats()
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := newRegistry(cfg, log, stats)
-	if err := reg.install(); err != nil {
-		t.Fatalf("install with empty keys file must not fail: %v", err)
-	}
-	defer reg.shutdown(0)
-
-	// Nothing routable yet: datagrams drop as unrouted, not crash.
-	reg.dispatch(rawDatagram{bytes: []byte(`{"_project":"ws-42","a":1}`), at: time.Now()})
-	if stats.DropsUnroutedUnknown.Load() != 1 {
-		t.Errorf("unknown drops: got %d", stats.DropsUnroutedUnknown.Load())
-	}
-
-	// Keys arrive (reconciler wrote the Secret): reload installs the route.
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		t.Fatal(err)
-	}
-	reg.reload()
-	if _, ok := reg.lookup("ws-42"); !ok {
-		t.Error("ws-42 not registered after reload")
-	}
-}
-
-// TestRegistry_ReloadUnchangedKeepsPipelines ensures the periodic keys-file
-// poll is a quiet no-op when the contents haven't changed: live pipelines
-// must be reused (no drain/replace churn on every tick) while the freshness
-// timestamp still advances.
-func TestRegistry_ReloadUnchangedKeepsPipelines(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := testConfig()
-	cfg.APIKey = ""
-	cfg.KeysFile = path
-	stats := newSelfStats()
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := newRegistry(cfg, log, stats)
-	if err := reg.install(); err != nil {
-		t.Fatal(err)
-	}
-	defer reg.shutdown(0)
-
-	before, ok := reg.lookup("ws-42")
-	if !ok {
-		t.Fatal("ws-42 not registered")
-	}
-	reg.reload()
-	after, ok := reg.lookup("ws-42")
-	if !ok {
-		t.Fatal("ws-42 gone after no-change reload")
-	}
-	if before != after {
-		t.Error("pipeline replaced on no-change reload")
-	}
-	if reg.LastKeysReloadUnix.Load() == 0 {
-		t.Error("freshness timestamp not stamped on no-change reload")
-	}
-}
-
-// TestRegistry_DispatchMalformedBumpsParseError ensures a malformed datagram
-// is counted as parse_error at the routing layer rather than silently
-// forwarded to a pipeline (which would poison the batch with a 4xx).
 func TestRegistry_DispatchMalformedBumpsParseError(t *testing.T) {
 	cfg := testConfig()
-	cfg.APIKey = "m0_default"
 	stats := newSelfStats()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	reg := newRegistry(cfg, log, stats)
@@ -478,103 +282,8 @@ func TestRegistry_DispatchMalformedBumpsParseError(t *testing.T) {
 	}
 }
 
-// TestRegistry_ReloadReplacesOnKeyChange: a project whose api key changes
-// across a reload must get a fresh pipeline (the old one drained). Without
-// this, a rotated key would continue shipping under the stale credential.
-func TestRegistry_ReloadReplacesOnKeyChange(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_old"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := testConfig()
-	cfg.APIKey = ""
-	cfg.KeysFile = path
-	cfg.ShutdownGrace = 0
-	stats := newSelfStats()
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := newRegistry(cfg, log, stats)
-	if err := reg.install(); err != nil {
-		t.Fatal(err)
-	}
-	defer reg.shutdown(0)
-
-	before, _ := reg.lookup("ws-42")
-	if before == nil || before.apiKey != "m0_old" {
-		t.Fatalf("initial pipeline: %+v", before)
-	}
-
-	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_new"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	reg.reload()
-
-	after, _ := reg.lookup("ws-42")
-	if after == nil {
-		t.Fatal("ws-42 missing after key rotation")
-	}
-	if after == before {
-		t.Error("expected new pipeline instance after key change; got same pointer")
-	}
-	if after.apiKey != "m0_new" {
-		t.Errorf("new apiKey: got %q want m0_new", after.apiKey)
-	}
-}
-
-// TestRegistry_ReloadFailureBumpsCounter: a malformed keys file on SIGHUP
-// must bump KeysReloadFailures so operators can detect a stale table from
-// /stats without scraping logs.
-func TestRegistry_ReloadFailureBumpsCounter(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := testConfig()
-	cfg.APIKey = ""
-	cfg.KeysFile = path
-	stats := newSelfStats()
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := newRegistry(cfg, log, stats)
-	if err := reg.install(); err != nil {
-		t.Fatal(err)
-	}
-	defer reg.shutdown(0)
-
-	if err := os.WriteFile(path, []byte(`{not json`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	reg.reload()
-	if got := reg.KeysReloadFailures.Load(); got != 1 {
-		t.Errorf("KeysReloadFailures: got %d want 1", got)
-	}
-	if reg.LastKeysReloadUnix.Load() != 0 {
-		t.Error("LastKeysReloadUnix should remain 0 after failed reload")
-	}
-
-	// Recover: a good file must zero the failure path's effect on
-	// LastKeysReloadUnix (we don't reset the failures counter — it's
-	// cumulative).
-	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	reg.reload()
-	if reg.LastKeysReloadUnix.Load() == 0 {
-		t.Error("LastKeysReloadUnix not stamped after successful reload")
-	}
-}
-
-// TestRegistry_MultiPipelineDrain: shutdown must drain all pipelines (N>1)
-// with pending batches. Validates the fan-out drain in registry.shutdown.
 func TestRegistry_MultiPipelineDrain(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_a","ws-99":"m0_b","ws-7":"m0_c"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	cfg := testConfig()
-	cfg.APIKey = ""
-	cfg.KeysFile = path
 	cfg.MaxRetries = 0
 	stats := newSelfStats()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -582,9 +291,10 @@ func TestRegistry_MultiPipelineDrain(t *testing.T) {
 	if err := reg.install(); err != nil {
 		t.Fatal(err)
 	}
+	registerProjects(t, reg, "ws-42", "ws-99", "ws-7")
 
 	for _, p := range []string{"ws-42", "ws-99", "ws-7"} {
-		body := []byte(`{"_project":"` + p + `","a":1}`)
+		body := []byte(`{"_project":"` + p + `","_token":"t","a":1}`)
 		reg.dispatch(rawDatagram{bytes: body, at: time.Now()})
 	}
 
@@ -600,112 +310,8 @@ func TestRegistry_MultiPipelineDrain(t *testing.T) {
 	}
 }
 
-// TestRegistry_ConcurrentReloadAndDispatch is a race-detector guard: a
-// reload that replaces pipelines must not race with concurrent dispatch.
-// The atomic.Pointer swap + start-before-publish ordering should keep this
-// safe; this test pins it under `go test -race`.
-func TestRegistry_ConcurrentReloadAndDispatch(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := testConfig()
-	cfg.APIKey = ""
-	cfg.KeysFile = path
-	cfg.ShutdownGrace = 0
-	cfg.MaxRetries = 0
-	stats := newSelfStats()
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := newRegistry(cfg, log, stats)
-	if err := reg.install(); err != nil {
-		t.Fatal(err)
-	}
-	defer reg.shutdown(0)
-
-	stop := make(chan struct{})
-	// Dispatch loop.
-	go func() {
-		body := []byte(`{"_project":"ws-42","op":"x"}`)
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-				reg.dispatch(rawDatagram{bytes: body, at: time.Now()})
-			}
-		}
-	}()
-	// Reload loop: alternate api key so each iteration replaces the
-	// pipeline (drain old, start new).
-	go func() {
-		alt := true
-		for i := 0; i < 50; i++ {
-			key := "m0_a"
-			if alt {
-				key = "m0_b"
-			}
-			alt = !alt
-			contents := `{"ws-42":"` + key + `"}`
-			tmp := path + ".tmp"
-			if err := os.WriteFile(tmp, []byte(contents), 0o600); err != nil {
-				return
-			}
-			_ = os.Rename(tmp, path)
-			reg.reload()
-		}
-		close(stop)
-	}()
-	<-stop
-}
-
-func TestRegistry_ReloadKeepsPreviousOnParseError(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := testConfig()
-	cfg.APIKey = ""
-	cfg.KeysFile = path
-	stats := newSelfStats()
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := newRegistry(cfg, log, stats)
-	if err := reg.install(); err != nil {
-		t.Fatal(err)
-	}
-	defer reg.shutdown(0)
-
-	if err := os.WriteFile(path, []byte(`{not json`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	reg.reload()
-
-	if _, ok := reg.lookup("ws-42"); !ok {
-		t.Error("ws-42 lost after bad reload — should keep previous table")
-	}
-}
-
-// TestListenerRoutesToCorrectPipeline is the end-to-end guard: real UDS
-// datagrams with `_project` set must reach the matching pipeline's
-// EventsReceived counter and nowhere else. Missing/unknown projects must
-// land in the process-wide unrouted drop counters.
-//
-// The flusher is not stubbed — pipelineStats.EventsReceived is incremented
-// by the batcher AFTER validateEvent succeeds and BEFORE the flush
-// attempt, so the assertion does not require a fake gateway. Flush
-// failures during the test are expected and irrelevant to the routing
-// contract under test.
 func TestListenerRoutesToCorrectPipeline(t *testing.T) {
-	dir := t.TempDir()
-	keysPath := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(keysPath, []byte(`{"ws-42":"m0_a","ws-99":"m0_b"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
 	cfg := testConfig()
-	cfg.APIKey = "m0_default" // registered under _default, fallback for no-_project datagrams
-	cfg.KeysFile = keysPath
 	cfg.MaxRetries = 0 // don't burn time retrying against a bogus gateway
 
 	stats := newSelfStats()
@@ -716,6 +322,7 @@ func TestListenerRoutesToCorrectPipeline(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reg.shutdown(0)
+	registerProjects(t, reg, "ws-42", "ws-99")
 
 	sockPath := shortTempSocketPath(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -742,12 +349,11 @@ func TestListenerRoutesToCorrectPipeline(t *testing.T) {
 		name string
 		body string
 	}{
-		{"ws-42 first", `{"_project":"ws-42","operation":"a"}`},
-		{"ws-42 second", `{"_project":"ws-42","operation":"b"}`},
-		{"ws-99 once", `{"_project":"ws-99","operation":"c"}`},
-		{"no _project goes to default", `{"operation":"d"}`},
-		{"unknown project drops", `{"_project":"ws-zzz","operation":"e"}`},
-		{"no _project, multi-tenant + default → default", `{"operation":"f"}`},
+		{"ws-42 first", `{"_project":"ws-42","_token":"t","operation":"a"}`},
+		{"ws-42 second", `{"_project":"ws-42","_token":"t","operation":"b"}`},
+		{"ws-99 once", `{"_project":"ws-99","_token":"t","operation":"c"}`},
+		{"no _project drops", `{"_token":"t","operation":"d"}`},
+		{"unknown project without a token drops", `{"_project":"ws-zzz","operation":"e"}`},
 	}
 	for _, c := range cases {
 		if _, err := cli.Write([]byte(c.body)); err != nil {
@@ -768,26 +374,27 @@ func TestListenerRoutesToCorrectPipeline(t *testing.T) {
 
 	p42, _ := reg.lookup("ws-42")
 	p99, _ := reg.lookup("ws-99")
-	pDef, _ := reg.lookup("")
 
-	if !waitFor(p42.stats.EventsReceived.Load, 2) {
-		t.Errorf("ws-42 EventsReceived: got %d want 2", p42.stats.EventsReceived.Load())
+	// registerProjects already delivered one datagram to each.
+	if !waitFor(p42.stats.EventsReceived.Load, 3) {
+		t.Errorf("ws-42 EventsReceived: got %d want 3", p42.stats.EventsReceived.Load())
 	}
-	if !waitFor(p99.stats.EventsReceived.Load, 1) {
-		t.Errorf("ws-99 EventsReceived: got %d want 1", p99.stats.EventsReceived.Load())
+	if !waitFor(p99.stats.EventsReceived.Load, 2) {
+		t.Errorf("ws-99 EventsReceived: got %d want 2", p99.stats.EventsReceived.Load())
 	}
-	if !waitFor(pDef.stats.EventsReceived.Load, 2) {
-		t.Errorf("_default EventsReceived: got %d want 2", pDef.stats.EventsReceived.Load())
+	if !waitFor(stats.DropsUnroutedMissing.Load, 1) {
+		t.Errorf("DropsUnroutedMissing: got %d want 1", stats.DropsUnroutedMissing.Load())
 	}
 	if !waitFor(stats.DropsUnroutedUnknown.Load, 1) {
 		t.Errorf("DropsUnroutedUnknown: got %d want 1", stats.DropsUnroutedUnknown.Load())
 	}
-	// Sanity: cross-tenant leak would show up here.
-	if got := p42.stats.EventsReceived.Load(); got != 2 {
-		t.Errorf("ws-42 leak check: got %d want exactly 2", got)
+	// Sanity: cross-tenant leak would show up here. Counts include the one
+	// datagram registerProjects sent to bring each project into the table.
+	if got := p42.stats.EventsReceived.Load(); got != 3 {
+		t.Errorf("ws-42 leak check: got %d want exactly 3", got)
 	}
-	if got := p99.stats.EventsReceived.Load(); got != 1 {
-		t.Errorf("ws-99 leak check: got %d want exactly 1", got)
+	if got := p99.stats.EventsReceived.Load(); got != 2 {
+		t.Errorf("ws-99 leak check: got %d want exactly 2", got)
 	}
 
 	cancel()
@@ -971,6 +578,36 @@ func (c chanSink) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
 	}
 }
 
+// waitForCount polls an atomic counter until it reaches want. The
+// dispatch → shared queue → demuxer → batcher path is asynchronous, so a
+// counter read immediately after dispatch is a race.
+func waitForCount(t *testing.T, what string, get func() uint64, want uint64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if get() == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s (got %d, want %d)", what, get(), want)
+}
+
+// registerProjects brings projects into the routing table the only way there
+// is: a datagram carrying `_project` plus its own `_token`.
+func registerProjects(t *testing.T, reg *registry, names ...string) {
+	t.Helper()
+	for _, n := range names {
+		body := []byte(`{"_project":"` + n + `","_token":"t-` + n + `"}`)
+		if ok, _ := reg.dispatch(rawDatagram{bytes: body, at: time.Now()}); !ok {
+			t.Fatalf("could not register %q", n)
+		}
+		if _, found := reg.lookup(n); !found {
+			t.Fatalf("%q not routable after registration", n)
+		}
+	}
+}
+
 func testConfig() Config {
 	return Config{
 		GatewayURL:    "http://localhost:0",
@@ -984,235 +621,76 @@ func testConfig() Config {
 	}
 }
 
-func TestLoadKeysFile_RejectsWorldWritable(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	// Chmod explicitly; os.WriteFile honors umask so 0o666 → 0o644 on most
-	// developer machines and we'd miss the rejection branch.
-	if err := os.Chmod(path, 0o666); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := loadKeysFile(path); err == nil {
-		t.Fatal("expected error for world-writable keys file")
-	}
-}
-
-func TestLoadKeysFile_AllowsSameDirSymlink(t *testing.T) {
-	dir := t.TempDir()
-	real := filepath.Join(dir, "real.json")
-	link := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(real, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(real, link); err != nil {
-		t.Skipf("symlink unsupported: %v", err)
-	}
-	keys, err := loadKeysFile(link)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if keys["ws-42"] != "m0_a" {
-		t.Errorf("got %+v", keys)
-	}
-}
-
-// TestLoadKeysFile_KubernetesSecretLayout mirrors how kubelet materializes a
-// Secret volume: file → ..data/file, ..data → ..<timestamp> directory.
-func TestLoadKeysFile_KubernetesSecretLayout(t *testing.T) {
-	dir := t.TempDir()
-	tsDir := filepath.Join(dir, "..2026_07_13_17_00_00.123")
-	if err := os.Mkdir(tsDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(tsDir, "keys.json"), []byte(`{"ws-42":"m0_a"}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("..2026_07_13_17_00_00.123", filepath.Join(dir, "..data")); err != nil {
-		t.Skipf("symlink unsupported: %v", err)
-	}
-	if err := os.Symlink(filepath.Join("..data", "keys.json"), filepath.Join(dir, "keys.json")); err != nil {
-		t.Fatal(err)
-	}
-	keys, err := loadKeysFile(filepath.Join(dir, "keys.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if keys["ws-42"] != "m0_a" {
-		t.Errorf("got %+v", keys)
-	}
-}
-
-func TestLoadKeysFile_RejectsSymlinkEscape(t *testing.T) {
-	outside := t.TempDir()
-	dir := t.TempDir()
-	real := filepath.Join(outside, "real.json")
-	link := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(real, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(real, link); err != nil {
-		t.Skipf("symlink unsupported: %v", err)
-	}
-	if _, err := loadKeysFile(link); err == nil {
-		t.Fatal("expected error for symlink escaping the keys directory")
-	}
-}
-
-func TestInstall_RejectsTooManyProjects(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	keys := map[string]string{"a": "k1", "b": "k2", "c": "k3"}
-	body, _ := json.Marshal(keys)
-	if err := os.WriteFile(path, body, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := testConfig()
-	cfg.APIKey = ""
-	cfg.KeysFile = path
-	cfg.MaxProjects = 2
-	reg := newRegistry(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), newSelfStats())
-	if err := reg.install(); err == nil {
-		t.Fatal("expected install to reject 3 projects with MaxProjects=2")
-	}
-}
-
-// 0 means unlimited, and it is the default. The cap defends against a
-// misconfigured keys file; a legitimate one that simply has many projects
-// must install in full rather than have the whole file rejected, which
-// routes nothing at all and is silent on the caller's side.
+// 0 means unlimited, and it is the default. A deployment with many live
+// workspaces must register them all rather than start refusing partway
+// through, which would be silent on the caller's side.
 func TestRegistry_MaxProjectsZeroMeansUnlimited(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	keys := map[string]string{}
-	for i := 0; i < 200; i++ {
-		keys[fmt.Sprintf("ws-%d", i)] = fmt.Sprintf("k%d", i)
-	}
-	body, _ := json.Marshal(keys)
-	if err := os.WriteFile(path, body, 0o600); err != nil {
-		t.Fatal(err)
-	}
 	cfg := testConfig()
-	cfg.APIKey = ""
-	cfg.KeysFile = path
 	cfg.MaxProjects = 0
+	cfg.QueueSize = 4096
 	reg := newRegistry(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), newSelfStats())
 	if err := reg.install(); err != nil {
-		t.Fatalf("install with MaxProjects=0 must accept 200 projects: %v", err)
+		t.Fatal(err)
 	}
 	defer reg.shutdown(0)
+
+	for i := 0; i < 200; i++ {
+		n := fmt.Sprintf("ws-%d", i)
+		body := []byte(`{"_project":"` + n + `","_token":"t"}`)
+		if ok, _ := reg.dispatch(rawDatagram{bytes: body, at: time.Now()}); !ok {
+			t.Fatalf("registration of %s refused with MaxProjects=0", n)
+		}
+	}
 	if got := len(reg.cur.Load().pipelines); got != 200 {
 		t.Fatalf("registered pipelines: got %d, want 200", got)
 	}
 }
 
-// The reload path has its own cap check, so unlimited has to hold there too
-// — this is the one that fired in production, rejecting a 149-entry file
-// every 30s and keeping an empty table.
-func TestRegistry_MaxProjectsZeroMeansUnlimitedOnReload(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(path, []byte(`{"ws-1":"k1"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := testConfig()
-	cfg.APIKey = ""
-	cfg.KeysFile = path
-	cfg.MaxProjects = 0
-	reg := newRegistry(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), newSelfStats())
-	if err := reg.install(); err != nil {
-		t.Fatal(err)
-	}
-	defer reg.shutdown(0)
-
-	keys := map[string]string{}
-	for i := 0; i < 200; i++ {
-		keys[fmt.Sprintf("ws-%d", i)] = fmt.Sprintf("k%d", i)
-	}
-	body, _ := json.Marshal(keys)
-	if err := os.WriteFile(path, body, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	reg.reload()
-
-	if got := len(reg.cur.Load().pipelines); got != 200 {
-		t.Fatalf("reloaded pipelines: got %d, want 200", got)
-	}
-	if got := reg.KeysReloadFailures.Load(); got != 0 {
-		t.Fatalf("KeysReloadFailures: got %d, want 0", got)
-	}
-}
-
-func TestRegistry_RequireProjectDisablesDefaultFallback(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := testConfig()
-	cfg.APIKey = "m0_default" // would normally absorb unlabeled datagrams
-	cfg.KeysFile = path
-	cfg.RequireProject = true
-	stats := newSelfStats()
-	reg := newRegistry(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), stats)
-	if err := reg.install(); err != nil {
-		t.Fatal(err)
-	}
-	defer reg.shutdown(0)
-
-	// No _project on the wire — with RequireProject set this must NOT route
-	// to the _default pipeline; it must drop as unrouted_missing.
-	reg.dispatch(rawDatagram{bytes: []byte(`{"a":1}`), at: time.Now()})
-	if stats.DropsUnroutedMissing.Load() != 1 {
-		t.Errorf("missing: got %d", stats.DropsUnroutedMissing.Load())
-	}
-}
-
 func TestRegistry_DispatchBadProjectType(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	if err := os.WriteFile(path, []byte(`{"ws-42":"m0_a"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	cfg := testConfig()
-	cfg.APIKey = "m0_default" // default exists; non-string _project must
-	// still NOT fall through to it (silent cross-tenant attribution).
-	cfg.KeysFile = path
 	stats := newSelfStats()
 	reg := newRegistry(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), stats)
 	if err := reg.install(); err != nil {
 		t.Fatal(err)
 	}
 	defer reg.shutdown(0)
+	registerProjects(t, reg, "ws-42")
 
-	reg.dispatch(rawDatagram{bytes: []byte(`{"_project":42,"a":1}`), at: time.Now()})
+	// The registration datagram reaches the pipeline asynchronously; let it
+	// land so the leak assertion below has a stable baseline.
+	p, _ := reg.lookup("ws-42")
+	waitForCount(t, "registration datagram to land", p.stats.EventsReceived.Load, 1)
+
+	reg.dispatch(rawDatagram{bytes: []byte(`{"_project":42,"_token":"t","a":1}`), at: time.Now()})
 	if stats.DropsUnroutedUnknown.Load() != 1 {
 		t.Errorf("unknown: got %d want 1", stats.DropsUnroutedUnknown.Load())
 	}
-	// Default pipeline must NOT have received it.
-	defPipe, _ := reg.lookup("")
-	if defPipe != nil && defPipe.stats.EventsReceived.Load() != 0 {
-		t.Errorf("non-string _project leaked into default pipeline: %d", defPipe.stats.EventsReceived.Load())
+	// It must not have leaked into the one real pipeline either.
+	if got := p.stats.EventsReceived.Load(); got != 1 {
+		t.Errorf("non-string _project leaked into ws-42: %d", got)
 	}
 }
 
 func TestRegistry_DispatchClosedPipelineAccountsRoutingClosed(t *testing.T) {
 	cfg := testConfig()
-	cfg.APIKey = "m0_default"
 	stats := newSelfStats()
 	reg := newRegistry(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), stats)
 	if err := reg.install(); err != nil {
 		t.Fatal(err)
 	}
+	registerProjects(t, reg, "ws-42")
 
-	// Pre-drain the default pipeline, then dispatch. trySend must report
-	// closed; dispatch must account it as routing_closed (not queue_full).
-	p, _ := reg.lookup("")
+	// Let the registration datagram land BEFORE draining: a datagram still
+	// in the shared queue when the pipeline closes is itself charged
+	// routing_closed by the demuxer, which would double the count below.
+	p, _ := reg.lookup("ws-42")
+	waitForCount(t, "registration datagram to land", p.stats.EventsReceived.Load, 1)
+
+	// Pre-drain the pipeline, then dispatch. trySend must report closed;
+	// dispatch must account it as routing_closed (not queue_full).
 	p.drain(0)
 
-	_, queueFull := reg.dispatch(rawDatagram{bytes: []byte(`{"a":1}`), at: time.Now()})
+	_, queueFull := reg.dispatch(rawDatagram{bytes: []byte(`{"_project":"ws-42","_token":"t","a":1}`), at: time.Now()})
 	if queueFull {
 		t.Error("dispatch reported queueFull on a closed pipeline; should be routing_closed")
 	}
@@ -1251,7 +729,6 @@ func TestRegistry_PerPipelineHandoffFullBumpsOnlyPerProjectQueueFull(t *testing.
 	defer func() { close(release) }()
 
 	cfg := testConfig()
-	cfg.APIKey = "m0_default"
 	cfg.GatewayURL = srv.URL
 	cfg.MaxBatch = 1
 	cfg.BatchWindow = 1 * time.Millisecond
@@ -1264,8 +741,9 @@ func TestRegistry_PerPipelineHandoffFullBumpsOnlyPerProjectQueueFull(t *testing.
 		t.Fatal(err)
 	}
 	defer reg.shutdown(0)
+	registerProjects(t, reg, "ws-42")
 
-	p, _ := reg.lookup("")
+	p, _ := reg.lookup("ws-42")
 
 	// Drip-feed datagrams one at a time with a small pause so the demuxer
 	// always drains shared before the next dispatch lands. After the
@@ -1276,7 +754,7 @@ func TestRegistry_PerPipelineHandoffFullBumpsOnlyPerProjectQueueFull(t *testing.
 	// before further sends start overflowing the handoff. Send 100 to
 	// guarantee plenty of overflow signals without depending on tight
 	// scheduler timing.
-	body := []byte(`{"a":1}`)
+	body := []byte(`{"_project":"ws-42","_token":"t","a":1}`)
 	for i := 0; i < 100; i++ {
 		ok, qfull := reg.dispatch(rawDatagram{bytes: body, at: time.Now()})
 		if qfull {
@@ -1305,7 +783,7 @@ func TestRegistry_PerPipelineHandoffFullBumpsOnlyPerProjectQueueFull(t *testing.
 }
 
 // TestRegistry_DemuxAccountsRoutingClosedForUnknownProject pins the
-// dispatch→reload→demux race: a datagram that was successfully routed at
+// dispatch→expiry→demux race: a datagram that was successfully routed at
 // dispatch time can find its destination pipeline gone by the time the
 // demuxer pops it (a SIGHUP reload removed the project in between). The
 // demuxer's lookup-miss branch must account this as routing_closed
@@ -1316,7 +794,6 @@ func TestRegistry_PerPipelineHandoffFullBumpsOnlyPerProjectQueueFull(t *testing.
 // unrouted_unknown).
 func TestRegistry_DemuxAccountsRoutingClosedForUnknownProject(t *testing.T) {
 	cfg := testConfig()
-	cfg.APIKey = "m0_default"
 	stats := newSelfStats()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	reg := newRegistry(cfg, log, stats)
@@ -1324,11 +801,12 @@ func TestRegistry_DemuxAccountsRoutingClosedForUnknownProject(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reg.shutdown(0)
+	registerProjects(t, reg, "ws-42")
 
 	// Inject a datagram pre-stamped with a project name that the current
 	// routing table does not contain. This is exactly the state the
 	// demuxer would observe if dispatch had stamped `project="ws-gone"`
-	// against an older routing table snapshot and reload subsequently
+	// against an older routing table snapshot and idle expiry subsequently
 	// retired the project.
 	reg.sharedRawCh <- rawDatagram{bytes: []byte(`{"a":1}`), at: time.Now(), project: "ws-gone"}
 
@@ -1342,10 +820,10 @@ func TestRegistry_DemuxAccountsRoutingClosedForUnknownProject(t *testing.T) {
 	if got := stats.DropsRoutingClosed.Load(); got != 1 {
 		t.Fatalf("process-wide DropsRoutingClosed: got %d want 1 (demuxer missed the lookup-miss branch)", got)
 	}
-	// Default pipeline must not be charged — the datagram never named it.
-	p, _ := reg.lookup("")
+	// The live pipeline must not be charged — the datagram never named it.
+	p, _ := reg.lookup("ws-42")
 	if got := p.stats.DropsRoutingClosed.Load(); got != 0 {
-		t.Errorf("default pipeline DropsRoutingClosed: got %d want 0 (lookup miss must not charge an unrelated pipeline)", got)
+		t.Errorf("ws-42 DropsRoutingClosed: got %d want 0 (lookup miss must not charge an unrelated pipeline)", got)
 	}
 	// And no other drop category should fire for a lookup miss.
 	if got := stats.DropsQueueFull.Load(); got != 0 {
