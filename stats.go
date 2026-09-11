@@ -19,18 +19,18 @@ type selfStats struct {
 	DropsFlushFailed atomic.Uint64
 	DropsShutdown    atomic.Uint64
 	// DropsUnroutedMissing counts datagrams dropped because no `_project`
-	// was set and no DefaultProject pipeline is registered (multi-tenant
-	// keys file only, MESH0_API_KEY unset).
+	// was set. There is no default pipeline to fall back to, so a datagram
+	// that names no project cannot be attributed to anyone.
 	DropsUnroutedMissing atomic.Uint64
 	// DropsUnroutedUnknown counts datagrams whose `_project` does not
 	// match any registered pipeline, or whose `_project` value is not a
 	// JSON string (the field is well-formed JSON but unusable for routing).
 	DropsUnroutedUnknown atomic.Uint64
 	// DropsRoutingClosed counts datagrams that landed on a pipeline that
-	// was already drained — the SIGHUP-reload or shutdown ordering caught
-	// the send after the pipeline was retired. Distinct from QueueFull so
+	// was already drained — idle expiry or shutdown ordering caught the
+	// send after the pipeline was retired. Distinct from QueueFull so
 	// operators chasing a "queue saturated" alert don't get misdirected to
-	// a project that's actually been removed/replaced via reload.
+	// a project that's actually been retired.
 	DropsRoutingClosed atomic.Uint64
 	// DropsBadToken counts datagrams carrying a `_token` that was present
 	// but not a JSON string. Distinct from unrouted_unknown_project on
@@ -70,11 +70,6 @@ type statsSnapshot struct {
 	ListenerFatal  bool                            `json:"listener_fatal"`
 	UptimeS        int64                           `json:"uptime_s"`
 	ByProject      map[string]projectStatsSnapshot `json:"by_project,omitempty"`
-	// KeysReloadFailures and LastKeysReloadUnix surface the health of the
-	// SIGHUP keys-file reload path. A non-zero failure count with a stale
-	// LastKeysReloadUnix means operators are running on an outdated table.
-	KeysReloadFailures uint64 `json:"keys_reload_failures,omitempty"`
-	LastKeysReloadUnix int64  `json:"last_keys_reload_unix,omitempty"`
 	// InlineProjects* describe the on-demand `_token` population: how many
 	// pipelines have been registered from a datagram's own credential, how
 	// many were later retired for idleness, and how many are live now. An

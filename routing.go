@@ -4,26 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 	"unicode/utf8"
 )
-
-// DefaultProject is the sentinel name the single-key (MESH0_API_KEY) path is
-// registered under. Datagrams without a `_project` field route here when it
-// is the only registered project, or when MESH0_KEYS_FILE is also set (the
-// API key is the fallback for unrouted datagrams).
-const DefaultProject = "_default"
 
 // pipelineHandoffDepth is the per-pipeline rawCh capacity. With Plan B's
 // shared queue absorbing bursts, the per-pipeline channel only needs enough
@@ -43,13 +30,7 @@ const pipelineHandoffDepth = 16
 // stall another.
 type pipeline struct {
 	project string
-	apiKey  string
 
-	// inline marks a pipeline created on demand from a datagram's `_token`
-	// rather than from the keys file. Only these are subject to idle
-	// expiry: a keys-file pipeline is an operator's declaration and stays
-	// registered whether or not traffic arrives.
-	inline bool
 	// lastSeen is unix-nanos of the most recent datagram dispatched here.
 	// Written on the listener's hot path, so an atomic rather than a lock.
 	lastSeen atomic.Int64
@@ -81,7 +62,7 @@ type pipeline struct {
 
 // trySend delivers dg to the pipeline's input queue without blocking. At
 // most one of (closed, queueFull) is true on a non-delivered send:
-//   - closed=true means the pipeline has been drained (SIGHUP reload retired
+//   - closed=true means the pipeline has been drained (idle expiry retired
 //     it, or shutdown is in progress). Caller accounts as drops.routing_closed
 //     — not queue_full, since the queue may have had capacity.
 //   - queueFull=true means the queue rejected the send under back-pressure.
@@ -101,7 +82,7 @@ func (p *pipeline) trySend(dg rawDatagram) (delivered, closed, queueFull bool) {
 
 // newPipeline wires a project's batcher + flusher with the supplied config.
 // Caller must invoke start() to launch the goroutines.
-func newPipeline(project, apiKey string, cfg Config, log *slog.Logger, processStats *selfStats) *pipeline {
+func newPipeline(project string, cfg Config, log *slog.Logger, processStats *selfStats) *pipeline {
 	pstats := newPipelineStats()
 	// Per-pipeline handoff buffer. The big in-flight buffer is the
 	// registry's shared queue; this just decouples demuxer from batcher.
@@ -113,7 +94,7 @@ func newPipeline(project, apiKey string, cfg Config, log *slog.Logger, processSt
 	b := newEventsBatcher(rawCh, batchCh, processStats, plog, cfg.MaxBatch, cfg.MaxEventBytes, cfg.BatchWindow)
 	b.pipelineStats = pstats
 
-	f := newEventsFlusherWithKey(batchCh, cfg, apiKey, plog, processStats)
+	f := newEventsFlusher(batchCh, cfg, plog, processStats)
 	f.pipelineStats = pstats
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -122,7 +103,6 @@ func newPipeline(project, apiKey string, cfg Config, log *slog.Logger, processSt
 
 	p := &pipeline{
 		project:     project,
-		apiKey:      apiKey,
 		rawCh:       rawCh,
 		batchCh:     batchCh,
 		batcher:     b,
@@ -175,12 +155,9 @@ func (p *pipeline) drain(grace time.Duration) {
 }
 
 // routingTable is an immutable snapshot of project → pipeline mappings.
-// Replaced atomically on SIGHUP so the listener's hot path is lock-free.
+// Replaced atomically on registration/expiry so the hot path is lock-free.
 type routingTable struct {
 	pipelines map[string]*pipeline
-	// hasDefault is true when DefaultProject is registered. Cached so the
-	// empty-`_project` fast path skips a map lookup.
-	hasDefault bool
 }
 
 // registry owns the live routing table plus the inputs needed to reload it.
@@ -221,16 +198,9 @@ type registry struct {
 	sharedClosed    bool
 	sharedCloseOnce sync.Once
 
-	// reloadMu serialises SIGHUP handlers so two concurrent signals cannot
-	// produce diverging tables. Read path (lookup) is lock-free via
-	// atomic.Pointer.
-	reloadMu sync.Mutex
-
-	// inlineMu serialises on-demand registration of `_token` pipelines.
-	// Distinct from reloadMu because the two contend on different paths:
-	// reload is a signal handler, inline registration happens on the
-	// listener's dispatch path the first time a project is seen. Both
-	// publish through the same copy-on-write swap of cur.
+	// inlineMu serialises on-demand registration and idle expiry of
+	// pipelines. Both publish through the same copy-on-write swap of cur;
+	// the read path (lookup) stays lock-free via atomic.Pointer.
 	inlineMu sync.Mutex
 
 	// InlineProjectsRegistered counts pipelines created from an inline
@@ -240,17 +210,9 @@ type registry struct {
 	InlineProjectsRegistered atomic.Uint64
 	InlineProjectsExpired    atomic.Uint64
 
-	// drainsInFlight tracks reload-initiated drain goroutines so shutdown
-	// can wait on them and they aren't orphaned if SIGHUP races SIGTERM.
+	// drainsInFlight tracks expiry-initiated drain goroutines so shutdown
+	// can wait on them and they aren't orphaned if expiry races SIGTERM.
 	drainsInFlight sync.WaitGroup
-
-	// KeysReloadFailures counts SIGHUP reloads that gave up after the
-	// retry (the previous routing table is kept). Surfaced in /stats so
-	// operators can detect a stale routing table without scraping logs.
-	KeysReloadFailures atomic.Uint64
-	// LastKeysReloadUnix is the unix-seconds timestamp of the most recent
-	// successful keys-file reload (0 if no reload has succeeded yet).
-	LastKeysReloadUnix atomic.Int64
 }
 
 func newRegistry(cfg Config, log *slog.Logger, processStats *selfStats) *registry {
@@ -267,52 +229,19 @@ func newRegistry(cfg Config, log *slog.Logger, processStats *selfStats) *registr
 	}
 }
 
-// install seeds the registry from the initial config (MESH0_API_KEY +
-// MESH0_KEYS_FILE) and starts every pipeline. Returns an error if the keys
-// file is set but unreadable/unparseable — initial startup is fail-fast on
-// config errors so operators see the problem immediately.
+// install publishes an empty routing table and starts the demuxer.
+//
+// There is nothing to seed. Every pipeline is created on demand by
+// registerInline the first time a project is seen on a datagram carrying its
+// own `_token`, so the agent has no notion of a declared project set and no
+// startup state that can be stale, empty, or half-provisioned.
 func (r *registry) install() error {
-	keys := map[string]string{}
-	if r.cfg.APIKey != "" {
-		keys[DefaultProject] = r.cfg.APIKey
-	}
-	if r.cfg.KeysFile != "" {
-		fileKeys, err := loadKeysFile(r.cfg.KeysFile)
-		if err != nil {
-			return fmt.Errorf("read MESH0_KEYS_FILE: %w", err)
-		}
-		for k, v := range fileKeys {
-			keys[k] = v
-		}
-	}
-	if len(keys) == 0 {
-		// Only reachable when MESH0_KEYS_FILE is set (loadConfig requires one
-		// of API_KEY/KEYS_FILE, and API_KEY alone always yields a key). A
-		// readable-but-empty keys file is a normal fresh-deploy state on
-		// Kubernetes: the Secret is templated as `{}` and a reconciler fills
-		// it in after the pod starts. Exiting here would turn that
-		// provisioning window into a crash loop, so start with an empty
-		// routing table and let the keys-file poll / SIGHUP install routes
-		// when they appear. Datagrams arriving meanwhile drop as unrouted.
-		r.log.Warn("keys file has no entries yet, starting with empty routing table",
-			"keys_file", r.cfg.KeysFile)
-	}
-	if r.cfg.MaxProjects > 0 && len(keys) > r.cfg.MaxProjects {
-		return fmt.Errorf("registered projects (%d) exceed MESH0_MAX_PROJECTS (%d); each pipeline costs ~QueueSize*MaxEventBytes of in-flight memory", len(keys), r.cfg.MaxProjects)
-	}
-	tbl := r.buildTable(keys, nil)
-	// Start pipelines BEFORE publishing the table so dispatch can never
-	// land a datagram on a pipeline whose goroutines aren't running yet.
-	for _, p := range tbl.pipelines {
-		p.start()
-	}
+	tbl := &routingTable{pipelines: map[string]*pipeline{}}
 	r.cur.Store(tbl)
-	// Start the demuxer AFTER pipelines are running so its first lookup
-	// always resolves to a started pipeline.
+	// Start the demuxer AFTER the table is published so its first lookup
+	// always sees a non-nil table.
 	go r.demux()
-	r.log.Info("routing installed",
-		"projects", sortedKeys(tbl.pipelines),
-		"has_default", tbl.hasDefault,
+	r.log.Info("routing installed (inline-token only)",
 		"shared_queue_size", cap(r.sharedRawCh),
 	)
 	return nil
@@ -321,14 +250,14 @@ func (r *registry) install() error {
 // demux drains sharedRawCh and forwards each datagram to its pipeline's
 // handoff channel. Runs in its own goroutine; exits when sharedRawCh is
 // closed (by shutdown). The lookup is performed against the live routing
-// table — a project removed by SIGHUP between dispatch and demux is
+// table — a project retired by idle expiry between dispatch and demux is
 // accounted as routing_closed.
 func (r *registry) demux() {
 	defer close(r.demuxDone)
 	for dg := range r.sharedRawCh {
 		p, ok := r.lookup(dg.project)
 		if !ok {
-			// Project disappeared between dispatch and demux (SIGHUP
+			// Project disappeared between dispatch and demux (idle expiry
 			// reload removed it after the datagram was queued). Account
 			// as routing_closed rather than re-deriving the original
 			// missing/unknown reason — the datagram was successfully
@@ -356,147 +285,14 @@ func (r *registry) demux() {
 	}
 }
 
-// reload re-reads the keys file and diffs against the current table. Added
-// projects get fresh pipelines; removed projects are drained with the
-// configured shutdown grace; projects whose key changed are replaced (drain
-// old + start new). MESH0_API_KEY is process-lifetime — it never reloads.
+// lookup resolves a datagram's project name to a pipeline.
 //
-// Best-effort: on parse error, the previous table is kept and an error is
-// logged. The agent will not take itself down because an operator pushed a
-// bad keys file.
-func (r *registry) reload() {
-	r.reloadMu.Lock()
-	defer r.reloadMu.Unlock()
-
-	if r.cfg.KeysFile == "" {
-		r.log.Warn("SIGHUP received but MESH0_KEYS_FILE is unset, nothing to reload")
-		return
-	}
-
-	fileKeys, err := loadKeysFile(r.cfg.KeysFile)
-	if err != nil {
-		// One retry on parse error — a partial write that landed without
-		// atomic rename can show up as transient garbage.
-		r.log.Warn("keys file reload failed, retrying once", "err", err)
-		time.Sleep(50 * time.Millisecond)
-		fileKeys, err = loadKeysFile(r.cfg.KeysFile)
-		if err != nil {
-			r.KeysReloadFailures.Add(1)
-			r.log.Error("keys file reload failed, keeping previous table", "err", err)
-			return
-		}
-	}
-
-	newKeys := map[string]string{}
-	if r.cfg.APIKey != "" {
-		newKeys[DefaultProject] = r.cfg.APIKey
-	}
-	for k, v := range fileKeys {
-		newKeys[k] = v
-	}
-
-	if r.cfg.MaxProjects > 0 && len(newKeys) > r.cfg.MaxProjects {
-		r.KeysReloadFailures.Add(1)
-		r.log.Error("keys file reload rejected: too many projects, keeping previous table",
-			"count", len(newKeys), "max_projects", r.cfg.MaxProjects)
-		return
-	}
-
-	prev := r.cur.Load()
-	if prev != nil && keysUnchanged(prev, newKeys) {
-		// Steady-state poll tick: the file re-read succeeded and nothing
-		// changed. Stamp freshness but skip the table swap so periodic polls
-		// don't churn allocations or spam "routing reloaded" every interval.
-		r.LastKeysReloadUnix.Store(time.Now().Unix())
-		return
-	}
-	tbl := r.buildTable(newKeys, prev)
-
-	// Start any freshly-spawned pipelines BEFORE swapping the table, so
-	// dispatch never lands on a pipeline whose goroutines aren't running.
-	for name, p := range tbl.pipelines {
-		if prev != nil {
-			if old, ok := prev.pipelines[name]; ok && old == p {
-				continue
-			}
-		}
-		p.start()
-	}
-
-	r.cur.Store(tbl)
-
-	// Drain pipelines that are gone or replaced. Track on a WaitGroup so
-	// a SIGTERM that races with a reload doesn't orphan these goroutines
-	// past the process exit (reg.shutdown waits on r.drainsInFlight).
-	if prev != nil {
-		for name, old := range prev.pipelines {
-			if cur, ok := tbl.pipelines[name]; !ok || cur != old {
-				r.drainsInFlight.Add(1)
-				go func(p *pipeline) {
-					defer r.drainsInFlight.Done()
-					p.drain(r.cfg.ShutdownGrace)
-				}(old)
-			}
-		}
-	}
-
-	r.LastKeysReloadUnix.Store(time.Now().Unix())
-	r.log.Info("routing reloaded",
-		"projects", sortedKeys(tbl.pipelines),
-		"has_default", tbl.hasDefault,
-	)
-}
-
-// keysUnchanged reports whether the desired keys map matches the live table
-// exactly — same project set, same API key per project. Used by reload to
-// make the periodic keys-file poll a quiet no-op in the steady state.
-func keysUnchanged(t *routingTable, keys map[string]string) bool {
-	if len(t.pipelines) != len(keys) {
-		return false
-	}
-	for name, key := range keys {
-		p, ok := t.pipelines[name]
-		if !ok || p.apiKey != key {
-			return false
-		}
-	}
-	return true
-}
-
-// buildTable produces a new routingTable that reuses pipelines from prev
-// when the project's key is unchanged. Pipelines whose key changed are
-// replaced (caller is responsible for draining the old one).
-func (r *registry) buildTable(keys map[string]string, prev *routingTable) *routingTable {
-	pipelines := make(map[string]*pipeline, len(keys))
-	for name, key := range keys {
-		if prev != nil {
-			if old, ok := prev.pipelines[name]; ok && old.apiKey == key {
-				pipelines[name] = old
-				continue
-			}
-		}
-		pipelines[name] = newPipeline(name, key, r.cfg, r.log, r.processStats)
-	}
-	_, hasDefault := pipelines[DefaultProject]
-	return &routingTable{pipelines: pipelines, hasDefault: hasDefault}
-}
-
-// lookup resolves a datagram's project name to a pipeline. project may be
-// empty (no `_project` on the wire); in that case the DefaultProject
-// pipeline is used if registered, else the lookup misses.
+// An empty project always misses. There is no default pipeline to fall back
+// to: the credential now travels with the datagram, so a datagram that names
+// no project cannot be attributed to anyone. Accounted as unrouted_missing.
 func (r *registry) lookup(project string) (*pipeline, bool) {
 	t := r.cur.Load()
-	if t == nil {
-		return nil, false
-	}
-	if project == "" {
-		// RequireProject disables the DefaultProject fallback so multi-tenant
-		// deployments can surface mis-tagged callers via unrouted_missing
-		// rather than silently cross-attributing them to whichever tenant
-		// owns MESH0_API_KEY.
-		if t.hasDefault && !r.cfg.RequireProject {
-			return t.pipelines[DefaultProject], true
-		}
+	if t == nil || project == "" {
 		return nil, false
 	}
 	p, ok := t.pipelines[project]
@@ -522,7 +318,7 @@ func (r *registry) lookup(project string) (*pipeline, bool) {
 //   - DropsUnrouted{Missing,Unknown} (process-wide) when no pipeline matches,
 //     including non-string `_project` values.
 //   - DropsRoutingClosed (per-pipeline + process-wide) when the destination
-//     pipeline was already closed at dispatch time (SIGHUP reload race).
+//     pipeline was already closed at dispatch time (expiry race).
 //   - DropsQueueFull (process-wide) when the shared queue is full —
 //     signalled to the listener via queueFull=true so the listener bumps it.
 //
@@ -550,22 +346,20 @@ func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
 		// anything else can happen to it.
 		dg.bytes = f.stripped
 	}
-	if f.badToken && r.cfg.InlineTokens {
-		// Present but unusable. NOT silently downgraded to the keys-file
-		// credential: a caller that meant to authenticate with a token and
-		// got the type wrong must not be quietly authorized as somebody
-		// else, and on an empty keys file that downgrade is a drop anyway.
+	if f.badToken {
+		// Present but unusable. There is nothing to fall back TO — the token
+		// is the only credential — so this is a drop, and a distinct one:
+		// bad_token means the emitter sent the field with the wrong type,
+		// which is a client bug, not an unknown project.
 		r.processStats.DropsBadToken.Add(1)
 		return false, false
 	}
-	if r.cfg.InlineTokens {
-		dg.token = f.token
-	}
+	dg.token = f.token
 
 	p, ok := r.lookup(project)
-	if !ok && r.cfg.InlineTokens && f.token != "" && project != "" {
+	if !ok && f.token != "" && project != "" {
 		// On-demand registration. A datagram that names a project AND
-		// carries its own credential needs no keys-file entry — the
+		// carries its own credential needs no prior declaration — the
 		// credential IS the authorization, and the gateway resolves the
 		// project from the token's own claim. This is the whole path for
 		// deployments that mint per-instance tokens and publish no keys.
@@ -589,7 +383,7 @@ func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
 	// Reachable in practice: an emitter that normally sends `_token` still
 	// emits without one when its own minting fails, and the project stays
 	// registered from earlier traffic.
-	if p.inline && dg.token == "" {
+	if dg.token == "" {
 		p.stats.DropsMissingToken.Add(1)
 		r.processStats.DropsMissingToken.Add(1)
 		return false, false
@@ -611,7 +405,7 @@ func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
 		return false, false
 	}
 	// Stamp project so the demuxer can route without re-parsing. May be ""
-	// when routing to DefaultProject — lookup() handles that case.
+	// never empty here: an empty project cannot resolve to a pipeline.
 	dg.project = project
 	// Manual RUnlock (no defer) — this is the listener's hot path; the
 	// defer overhead is measurable here and the function is small enough
@@ -641,24 +435,23 @@ func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
 // a datagram carrying its own `_token`. Returns the pipeline and true when the
 // project is routable afterwards.
 //
-// WHY THIS EXISTS. Under the keys-file model an operator declares every
-// project up front, so an unknown `_project` is a mis-tagged caller and
-// dropping it is right. Under inline credentials there is nothing to declare:
-// the emitting instance mints a token whose own claim names the project, and
-// the first this agent hears of that project is the datagram in hand. Without
-// on-demand registration such a deployment routes nothing at all — which is
-// exactly the empty-keys-file silence this path was built to end.
+// WHY THIS IS THE ONLY WAY A PIPELINE IS CREATED. There is nothing to
+// declare up front: the emitting instance mints a token whose own claim names
+// the project, and the first this agent hears of that project is the datagram
+// in hand. The agent therefore holds no project list, which is the point —
+// the previous model kept one and rebuilt it from a keys file on every poll,
+// and a poll that read an empty file tore down every live pipeline and dropped
+// its buffered batches as `shutdown`. A table that is only ever added to (and
+// retired by idleness) has no such failure mode.
 //
-// The pipeline is created with an EMPTY apiKey. That is deliberate and load
-// bearing: an inline pipeline has no credential of its own, and every batch it
-// flushes must carry the token that arrived with its events (EventBatch.Token).
-// Giving it a fallback key would let a rotation gap or a stripped token
-// silently authenticate one project's events under another credential.
+// The pipeline holds NO credential of its own. Every batch it flushes carries
+// the token that arrived with its events (EventBatch.Token). A per-pipeline
+// fallback key would let a rotation gap or a stripped token silently
+// authenticate one project's events under another credential.
 //
-// MaxProjects is enforced here as well as on the keys file, and the two share
-// a budget: an inline registration that would exceed the cap is refused and the
-// datagram drops as unrouted_unknown, which is the same outcome an unknown
-// project has always had.
+// MaxProjects is enforced here: a registration that would exceed the cap is
+// refused and the datagram drops as unrouted_unknown, the same outcome an
+// unknown project has always had.
 func (r *registry) registerInline(project string) (*pipeline, bool) {
 	r.inlineMu.Lock()
 	defer r.inlineMu.Unlock()
@@ -676,8 +469,7 @@ func (r *registry) registerInline(project string) (*pipeline, bool) {
 		return nil, false
 	}
 
-	p := newPipeline(project, "", r.cfg, r.log, r.processStats)
-	p.inline = true
+	p := newPipeline(project, r.cfg, r.log, r.processStats)
 	p.start()
 
 	// Copy-on-write publish, same discipline as reload: readers hold the old
@@ -687,7 +479,6 @@ func (r *registry) registerInline(project string) (*pipeline, bool) {
 		for name, existing := range prev.pipelines {
 			next.pipelines[name] = existing
 		}
-		next.hasDefault = prev.hasDefault
 	}
 	next.pipelines[project] = p
 	r.cur.Store(next)
@@ -728,7 +519,7 @@ func (r *registry) expireInline(idle time.Duration, now time.Time) int {
 	cutoff := now.Add(-idle).UnixNano()
 	var retired []*pipeline
 	for name, p := range prev.pipelines {
-		if p.inline && p.lastSeen.Load() < cutoff {
+		if p.lastSeen.Load() < cutoff {
 			retired = append(retired, p)
 			_ = name
 		}
@@ -739,8 +530,7 @@ func (r *registry) expireInline(idle time.Duration, now time.Time) int {
 	}
 
 	next := &routingTable{
-		pipelines:  make(map[string]*pipeline, len(prev.pipelines)-len(retired)),
-		hasDefault: prev.hasDefault,
+		pipelines: make(map[string]*pipeline, len(prev.pipelines)-len(retired)),
 	}
 	for name, p := range prev.pipelines {
 		keep := true
@@ -799,7 +589,7 @@ func (r *registry) runInlineExpiry(idle time.Duration, stop <-chan struct{}) {
 
 // shutdown drains every pipeline. Called from main on SIGINT/SIGTERM after
 // the listener has stopped accepting new datagrams. Also waits for any
-// reload-initiated drains so SIGHUP-then-SIGTERM doesn't orphan goroutines.
+// expiry-initiated drains so expiry-then-SIGTERM doesn't orphan goroutines.
 //
 // Ordering matters: close the shared queue and wait the demuxer to exit
 // before touching pipelines, so the demuxer doesn't race a pipeline.drain
@@ -847,13 +637,7 @@ func (r *registry) inlineLive() int {
 	if t == nil {
 		return 0
 	}
-	n := 0
-	for _, p := range t.pipelines {
-		if p.inline {
-			n++
-		}
-	}
-	return n
+	return len(t.pipelines)
 }
 
 func (r *registry) snapshot() map[string]projectStatsSnapshot {
@@ -868,96 +652,6 @@ func (r *registry) snapshot() map[string]projectStatsSnapshot {
 	return out
 }
 
-// keysFileMaxBytes caps the keys file read so a runaway-large file (or an
-// attacker-substituted /dev/zero symlink target, if O_NOFOLLOW were missing)
-// cannot exhaust process memory on SIGHUP. 1 MiB comfortably fits ~4000
-// project entries at typical key/name sizes.
-const keysFileMaxBytes = 1 << 20
-
-// loadKeysFile reads a JSON object mapping project name → API key. Project
-// names must be non-empty and may not start with `_` (reserved for sentinels
-// like DefaultProject). API keys must be non-empty strings.
-//
-// The file is opened with O_NOFOLLOW so an attacker who can replace the
-// configured path with a symlink cannot redirect us to read arbitrary files.
-// Symlinks that resolve within the file's own directory are followed — see
-// openKeysFile — because Kubernetes Secret volumes always present files that
-// way. World-writable files are rejected (a writable keys file is effectively
-// a per-process root credential for every registered tenant — operators
-// should keep it 0600 or 0640). The read is capped at keysFileMaxBytes.
-func loadKeysFile(path string) (map[string]string, error) {
-	f, err := openKeysFile(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("keys file %q is not a regular file", path)
-	}
-	if fi.Mode().Perm()&0o002 != 0 {
-		return nil, fmt.Errorf("keys file %q is world-writable (perm %#o); chmod 0600 it", path, fi.Mode().Perm())
-	}
-	b, err := io.ReadAll(io.LimitReader(f, keysFileMaxBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(b)) > keysFileMaxBytes {
-		return nil, fmt.Errorf("keys file %q exceeds %d bytes", path, keysFileMaxBytes)
-	}
-	var raw map[string]string
-	dec := json.NewDecoder(bytes.NewReader(b))
-	if err := dec.Decode(&raw); err != nil {
-		return nil, fmt.Errorf("parse keys file: %w", err)
-	}
-	for name, key := range raw {
-		if name == "" {
-			return nil, errors.New("keys file: project name must not be empty")
-		}
-		if name[0] == '_' {
-			return nil, fmt.Errorf("keys file: project name %q must not start with '_' (reserved)", name)
-		}
-		if key == "" {
-			return nil, fmt.Errorf("keys file: api key for project %q must not be empty", name)
-		}
-	}
-	return raw, nil
-}
-
-// openKeysFile opens the keys file, refusing symlinks that escape the file's
-// own directory. Kubernetes Secret volumes always present files as symlinks
-// (`keys.json → ..data/keys.json`, with `..data` itself a symlink to a
-// timestamped directory inside the mount), so a flat O_NOFOLLOW open can
-// never start under the agent's primary deployment mode. Following a link
-// that stays inside the directory adds no reach: an attacker who can plant a
-// symlink there can already overwrite the keys file itself. Links resolving
-// elsewhere (/etc/shadow, /dev/zero) are still refused, which is what the
-// O_NOFOLLOW was protecting against.
-func openKeysFile(path string) (*os.File, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	// ELOOP from O_NOFOLLOW surfaces as a "too many levels of symbolic
-	// links" syscall error.
-	if err == nil || !errors.Is(err, syscall.ELOOP) {
-		return f, err
-	}
-	base, err := filepath.EvalSymlinks(filepath.Dir(path))
-	if err != nil {
-		return nil, err
-	}
-	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return nil, err
-	}
-	rel, err := filepath.Rel(base, resolved)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return nil, fmt.Errorf("keys file %q is a symlink resolving outside its directory (refusing for safety)", path)
-	}
-	return os.OpenFile(resolved, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-}
-
 // projectKeyMarker is the cheap prefilter for the no-_project fast path:
 // every datagram that lacks this substring cannot possibly carry a top-level
 // `_project` field, so we skip the scanner entirely. False positives (the
@@ -966,8 +660,8 @@ func openKeysFile(path string) (*os.File, error) {
 var projectKeyMarker = []byte(`"_project"`)
 
 // tokenKeyMarker is the same prefilter for `_token`, the per-datagram
-// credential used by deployments that mint their own instance tokens instead
-// of publishing a keys file. See extractAndStripFields.
+// credential that authorizes every datagram the agent accepts.
+// See extractAndStripFields.
 var tokenKeyMarker = []byte(`"_token"`)
 
 // projectKey / tokenKey are the bare key names compared against unquoted JSON
@@ -1044,8 +738,8 @@ func extractAndStripRouting(b []byte) routingFields {
 //   - badProject=true means at least one `_project` member was present but
 //     its LAST occurrence is not a JSON string (e.g. number, null, object).
 //     The body is still well-formed JSON; routing is unusable. Caller
-//     accounts as unrouted_unknown so a misbehaving client SDK doesn't get
-//     silently routed to the DefaultProject fallback.
+//     accounts as unrouted_unknown so a misbehaving client SDK is visible
+//     rather than being silently attributed somewhere.
 //   - removed=false, malformed=false, badProject=false means the input is a
 //     JSON object with no `_project` (the common case).
 //

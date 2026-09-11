@@ -90,7 +90,7 @@ prompt           { system, messages, prompt }
 
 ```
 POST <MESH0_BASE_URL>/v1/events
-Authorization: Bearer <MESH0_API_KEY>
+Authorization: Bearer <the datagram's _token>
 Content-Type: application/json
 Body: {"events":[{...}, ...]}
 ```
@@ -110,7 +110,6 @@ Mount a shared volume for the socket and bind it from both containers:
 ```bash
 docker volume create mesh0-agent
 docker run --rm \
-  -e MESH0_API_KEY=m0_... \
   -v mesh0-agent:/run/mesh0 \
   ghcr.io/mesh0-ai/metrics-agent:latest
 ```
@@ -145,8 +144,7 @@ spec:
             - { name: mesh0-agent, mountPath: /run/mesh0 }
         - name: mesh0-metrics-agent
           image: ghcr.io/mesh0-ai/metrics-agent:latest
-          env:
-            - { name: MESH0_API_KEY, valueFrom: { secretKeyRef: { name: mesh0, key: api-key } } }
+          # No credential env: every datagram carries its own `_token`.
           volumeMounts:
             - { name: mesh0-agent, mountPath: /run/mesh0 }
           ports:
@@ -185,8 +183,6 @@ All knobs are environment variables.
 
 | Variable                  | Default                | Notes                                      |
 |---------------------------|------------------------|--------------------------------------------|
-| `MESH0_API_KEY`           | (one of API_KEY / KEYS_FILE required) | Per-project API key (`m0_…`). Registered under the sentinel project `_default`; receives datagrams that have no `_project` field. |
-| `MESH0_KEYS_FILE`         | unset                  | Path to a JSON object mapping project → API key for **multi-tenant routing**. Reloaded on `SIGHUP` and every `MESH0_KEYS_POLL_MS`. Atomic-rename when writing. An empty object (`{}`) is accepted at startup — the agent runs with no routes until keys appear. See [Multi-tenant routing](#multi-tenant-routing). |
 | `MESH0_BASE_URL`          | `https://api.mesh0.ai` | Override for self-hosted / staging.        |
 | `MESH0_EVENTS_PATH`       | `/v1/events`           | Path appended to base URL.                 |
 | `MESH0_LISTEN_PATH`       | `/run/mesh0/agent.sock`| UDS-DGRAM bind path (≤103 bytes — `sun_path` cap). Parent dir is `MkdirAll`'d; stale socket files are unlinked on startup; bind fails if `chmod 0666` is rejected. |
@@ -197,141 +193,94 @@ All knobs are environment variables.
 | `MESH0_QUEUE_SIZE`        | `2000`                 | **Process-wide** bounded queue depth between the listener and the per-project demuxer. Worst-case in-flight memory in the shared queue is `QUEUE_SIZE × MESH0_MAX_EVENT_BYTES`, *independent of the number of registered projects*. Each project additionally owns a 16-slot handoff buffer, so total worst-case in-flight memory is `(QUEUE_SIZE + 16 × registered_projects) × MESH0_MAX_EVENT_BYTES`. The handoff term is dominated by `QUEUE_SIZE` at modest project counts but grows linearly with the number of registered projects — at 4096 projects with 1 MB events the handoff buffers alone account for ~64 GB worst-case, so deployments running that many projects should also lower `MESH0_MAX_EVENT_BYTES` and size the sidecar's memory limit accordingly. Size `QUEUE_SIZE` to match your sidecar's memory limit. |
 | `MESH0_MAX_RETRIES`       | `4`                    | Retry budget per batch on 429/5xx/network. |
 | `MESH0_SHUTDOWN_GRACE_MS` | `15000`                | Max wait for in-flight flushes on exit.    |
-| `MESH0_KEYS_POLL_MS`      | `30000`                | How often the agent re-reads `MESH0_KEYS_FILE` on its own, independent of `SIGHUP`. Range `[0, 3600000]`; `0` disables polling (SIGHUP-only). Unchanged contents are a quiet no-op. Needed on Kubernetes, where Secret volume updates propagate asynchronously and an externally-sent `SIGHUP` can race the mount. Ignored when `MESH0_KEYS_FILE` is unset. |
-| `MESH0_MAX_PROJECTS`      | `0` (unlimited)        | Cap on registered pipelines (incl. `_default`). Range `[0, 4096]`; **`0` disables the cap** and is the default. Each pipeline costs two goroutines, an `http.Client`, and a 16-slot handoff buffer (`16 × MAX_EVENT_BYTES` worst case), so a cap guards against a misconfigured keys file with one entry per request-id. It is **off by default because the failure mode is all-or-nothing**: a keys file is written wholesale by a control plane, so a legitimate file that exceeds the cap has its *entire* contents rejected and the agent routes nothing at all — `install` fails fast, and a reload is rejected, keeps the previous table, and bumps `keys_reload_failures`. Set a positive value only if you want that guard and have sized it against your own keys file. |
-| `MESH0_INLINE_TOKENS`     | `true`                 | Honor a per-datagram `_token` credential: it authorizes that datagram's batch, and a project seen only via such a datagram is registered on demand without a keys-file entry. Default-on is a no-op for deployments that never send the field, and a project can only be auto-registered by a caller that presented a credential for it. Set `0` to refuse inline credentials — the field is still stripped from the body. When enabled, neither `MESH0_API_KEY` nor `MESH0_KEYS_FILE` is required at startup. See [Inline credentials](#inline-credentials-_token). |
-| `MESH0_INLINE_IDLE_MS`    | `900000` (15m)         | Retire an on-demand `_token` pipeline after this long without traffic. Range `[0, 86400000]`; `0` disables expiry. Keys-file pipelines are never expired. Bounds memory for deployments that churn through ephemeral projects, where the population turns over rather than growing — watch `inline_projects_registered` / `inline_projects_expired` / `inline_projects_live` in `/stats`. |
-| `MESH0_REQUIRE_PROJECT`   | `false`                | When set, datagrams arriving without a `_project` field are **not** routed to the `MESH0_API_KEY` fallback — they drop as `unrouted_missing_project`. Recommended for multi-tenant deployments where silently cross-attributing to the default tenant would be a tagging bug. |
+| `MESH0_MAX_PROJECTS`      | `0` (unlimited)        | Cap on registered pipelines. Range `[0, 4096]`; **`0` disables the cap** and is the default. Each pipeline costs two goroutines, an `http.Client`, and a 16-slot handoff buffer (`16 × MAX_EVENT_BYTES` worst case). Since every registration requires a valid `_token`, reaching a sane cap means an emitter is minting a distinct `_project` per request. Set a positive value only if you want that guard. |
+| `MESH0_INLINE_IDLE_MS`    | `900000` (15m)         | Retire a pipeline after this long without traffic. Range `[0, 86400000]`; `0` disables expiry. This is the **only** thing that removes a pipeline, so it is what bounds the population for deployments whose projects turn over — watch `inline_projects_registered` / `inline_projects_expired` / `inline_projects_live` in `/stats`. |
 | `MESH0_LOG_LEVEL`         | `info`                 | `debug` \| `info` \| `warn` \| `error`     |
 
 ## Multi-tenant routing
 
-One sidecar per host can ship events for many mesh0 projects. The caller
-adds a `_project` field to each datagram naming which project it belongs
-to; the agent strips the field and POSTs each batch with the matching
-project's API key.
+One sidecar per host ships events for many mesh0 projects. Each datagram
+names its project in `_project` **and carries its own credential in
+`_token`**:
 
 ```jsonc
 {
   "_project": "workspace-42",
+  "_token": "eyJhbGciOiJFZERTQSJ9…",
   "operation": "checkout.charge",
   "duration_ms": 42
 }
 ```
 
-Set `MESH0_KEYS_FILE` to a JSON object mapping project → API key:
+`_token` is the **only** credential the agent understands. There is no keys
+file, no `MESH0_API_KEY`, and no default project — the agent is configured
+with no credentials at all, and learns every project from the traffic it
+receives. The first datagram naming a project registers a pipeline for it on
+demand; the token becomes the `Authorization: Bearer` header for the batch
+those events land in.
 
-```json
-{
-  "workspace-42": "m0_abc...",
-  "workspace-99": "m0_def..."
-}
-```
+> **Why there is no keys file.** Earlier versions rebuilt the entire routing
+> table from a keys file on every poll and drained any pipeline missing from
+> the rebuild. Projects registered from a `_token` are not in that file by
+> construction, so an agent pointed at an empty keys file tore down every
+> live pipeline twice a minute and dropped its buffered events as
+> `shutdown`. On one production cluster that cost 11.8M of 28.4M events.
+> Registration is now purely additive: nothing but idle expiry removes a
+> pipeline.
 
-Write the file with **atomic rename** (`write tmp → rename`) and send
-`SIGHUP` to the agent. The agent diffs the new file against its in-memory
-table, spawns pipelines for added projects, drains pipelines for removed
-projects, and replaces pipelines whose key rotated. A parse error keeps
-the previous table — a bad reload does not take the agent down.
+mesh0's admission layer accepts a non-`m0_` bearer as an open-mode instance
+token, so the agent forwards the token as-is and the gateway resolves the
+tenant from it.
 
-The keys file is opened with `O_NOFOLLOW` and rejected if it is a
-non-regular file, world-writable, or larger than 1 MiB. A symlink is
-followed only when it resolves to a regular file **inside the keys file's
-own directory** — this is how Kubernetes Secret volumes present files
-(`keys.json → ..data/keys.json`), so Secret mounts work out of the box;
-links resolving anywhere else are refused. Keep it
-**mode `0600`** (or `0640` if the agent runs as its own uid) — a writable
-keys file is effectively a root credential for every registered tenant.
-The file count is uncapped by default; set `MESH0_MAX_PROJECTS` to a positive
-value to pin it to your scale, remembering that a file exceeding the cap is
-rejected in full rather than truncated.
+**Tenant identity comes from the `Authorization` header**, never from
+anything in the event body. The agent strips every top-level `_project` and
+`_token` before forwarding, so the gateway sees the same `CustomEventInput`
+shape it always has.
 
-**Key rotation note.** When a project's API key is rotated via SIGHUP,
-the old pipeline drains asynchronously over `MESH0_SHUTDOWN_GRACE_MS`
-(default 15s) using the *old* key for any queued events. For routine
-rotation this is the right tradeoff (don't drop events). For
-**compromised-key** rotation, set `MESH0_SHUTDOWN_GRACE_MS=0` before the
-SIGHUP to cut over immediately at the cost of in-flight batches.
+### Routing rules
 
-**Tenant identity comes from the `Authorization` header**, not from
-anything in the event body. With inline credentials that header is derived
-from the datagram's own `_token` (see below), but the rule is unchanged: the
-gateway reads identity from the header, never from the payload. The agent strips every top-level `_project`
-key before forwarding; the gateway must not read tenant identity from
-the event payload.
-
-Routing rules:
-
-| `_project` present? | Keys configured                          | Behavior |
-|---------------------|------------------------------------------|----------|
-| no                  | one (`MESH0_API_KEY`)                    | route to that key (legacy path)                  |
-| no                  | many (`MESH0_KEYS_FILE` only)            | drop, `drops.unrouted_missing_project`++         |
-| no                  | any, `MESH0_REQUIRE_PROJECT=1`           | drop, `drops.unrouted_missing_project`++         |
-| yes, known          | any                                      | route to matching key                            |
-| yes, unknown        | any                                      | drop, `drops.unrouted_unknown_project`++         |
-| yes, non-string val | any                                      | drop, `drops.unrouted_unknown_project`++         |
-| yes, unknown        | datagram carries `_token`                | **register the project on demand**, authorize the batch with that token |
-| any                 | datagram carries a non-string `_token`   | drop, `drops.bad_token`++                        |
-| yes, inline-registered | datagram carries no `_token`          | drop, `drops.missing_token`++                    |
-
-Both env vars may be set simultaneously; file routes take precedence and
-`MESH0_API_KEY` is the fallback for datagrams without `_project`. Project
-names beginning with `_` are reserved (the agent uses `_default`
-internally) and are rejected at load time.
-
-Project names live only on the UDS wire between caller and sidecar. The
-agent strips `_project` before POSTing so the gateway sees the same
-`CustomEventInput` shape it does today.
-
-### Inline credentials (`_token`)
-
-A datagram may carry its own credential in a top-level `_token` field:
-
-```json
-{"_project": "workspace-42", "_token": "eyJhbGciOiJFZERTQSJ9…", "operation": "…"}
-```
-
-This exists for deployments where the emitter mints its own short-lived
-instance token rather than an operator publishing a keys file. mesh0's
-admission layer already accepts a non-`m0_` bearer as an open-mode instance
-token, so the agent simply forwards it: `_token` becomes the
-`Authorization: Bearer` header for the batch those events land in.
+| `_project` | `_token`            | Behavior |
+|------------|---------------------|----------|
+| absent     | any                 | drop, `drops.unrouted_missing_project`++ |
+| known      | present             | route; the token authorizes the batch |
+| known      | absent              | drop, `drops.missing_token`++ |
+| unknown    | present             | **register the project on demand**, then route |
+| unknown    | absent              | drop, `drops.unrouted_unknown_project`++ |
+| any        | present, non-string | drop, `drops.bad_token`++ |
+| non-string | any                 | drop, `drops.unrouted_unknown_project`++ |
 
 Three properties are load-bearing:
 
-- **`_token` takes precedence over the keys file.** A datagram that carries
-  one is authorized by it even when its project also has a keys-file entry.
-  The keys file remains the credential for datagrams that carry no token, so
-  existing deployments are unaffected — they never send the field.
-- **An unknown project that arrives with a token is registered on demand.**
-  There is nothing to declare up front: the token's own claim names the
-  project server-side, and the first the agent hears of it is the datagram.
-  Without this a keys-less deployment routes nothing at all. On-demand
-  registrations count against `MESH0_MAX_PROJECTS` and are retired after
-  `MESH0_INLINE_IDLE_MS` without traffic; keys-file projects are never
-  expired, because an operator declared those and a quiet project is not a
-  departed one.
-- **`_token` is always stripped from the body, even when inline tokens are
-  disabled and even when the value is unusable.** A credential left in the
-  payload is written into stored telemetry and readable by anyone who can
-  later read the event back. Honoring the credential is configurable;
-  removing it is not.
+- **`_token` is always stripped from the body, even when it is unusable.** A
+  credential left in the payload is written into stored telemetry and
+  readable by anyone who can later read the event back. This is not
+  configurable.
+- **A pipeline holds no credential of its own.** Every batch is authorized by
+  the token that arrived with its events, so a rotation gap can never
+  authenticate one project's events under another's credential. A datagram
+  routed to a live pipeline **without** a token therefore drops as
+  `drops.missing_token` — reachable whenever an emitter that normally
+  attaches one fails to mint it. The alternative would be to POST under an
+  empty bearer, spending a full batch to earn a 401 that reads like a gateway
+  problem rather than an emitter one.
+- **A non-string `_token` is its own drop category.** It is not silently
+  downgraded: a caller that meant to authenticate as one project must not be
+  quietly authorized as another, and `drops.bad_token` distinguishes a client
+  bug from an unknown project.
 
-A `_token` that is present but not a JSON string drops the datagram as
-`drops.bad_token` rather than silently falling back to the keys-file
-credential — a caller that meant to authenticate as one project must not be
-quietly authorized as another.
+Idle pipelines are retired after `MESH0_INLINE_IDLE_MS` without traffic —
+the only thing that removes one. Registrations count against
+`MESH0_MAX_PROJECTS` when it is set.
 
-An on-demand pipeline holds no credential of its own, so a datagram routed to
-one **without** a `_token` drops as `drops.missing_token`. This is reachable
-whenever an emitter that normally attaches a credential fails to mint one: the
-project stays registered from earlier traffic, and the alternative would be to
-batch those events and POST them under an empty bearer — spending a full batch
-to earn a 401 that reads like a gateway problem rather than an emitter one.
-Keys-file projects are unaffected; they authenticate from the file.
+Project names live only on the UDS wire between caller and sidecar.
 
-Set `MESH0_INLINE_TOKENS=0` to refuse inline credentials entirely; the field
-is still stripped.
+### Retired environment variables
+
+`MESH0_API_KEY`, `MESH0_KEYS_FILE`, `MESH0_KEYS_POLL_MS`,
+`MESH0_INLINE_TOKENS` and `MESH0_REQUIRE_PROJECT` are no longer read. They
+are **ignored with a warning** rather than being fatal, so a chart that still
+sets one keeps booting through the rollout that removes it. `SIGHUP` no
+longer does anything.
 
 ## Health & observability
 
@@ -367,9 +316,9 @@ The agent exposes a small HTTP server on `MESH0_HEALTH_ADDR` (default `:8126`):
     gateway failures (retry-exhausted 5xx/429, or non-retryable 4xx) so
     operators can distinguish "gateway broken" from "we shut down."
   - `events_dropped.routing_closed` counts datagrams that landed on a
-    pipeline retired by a SIGHUP reload between routing-lookup and queue
-    send. Distinct from `queue_full` so a reload churn doesn't masquerade
-    as back-pressure.
+    pipeline retired by idle expiry between routing-lookup and queue
+    send. Distinct from `queue_full` so expiry doesn't masquerade as
+    back-pressure.
   - `buffer_degraded` is `true` if the kernel rejected the agent's
     `SO_RCVBUF=8MB` request — investigate elevated socket-level loss
     via `/proc/net/unix` queue depth if so.
@@ -398,9 +347,9 @@ it. Four loss points, all observable in `/stats`:
 3. **Flush failures** (`drops.flush_failed`) — gateway 4xx (non-429),
    or 429/5xx after `MESH0_MAX_RETRIES`.
 4. **Unrouted** (`drops.unrouted_missing_project`,
-   `drops.unrouted_unknown_project`) — multi-tenant only. Datagrams with
-   no `_project` (and no `MESH0_API_KEY` fallback) or with a `_project`
-   that doesn't match any registered pipeline are dropped here.
+   `drops.unrouted_unknown_project`) — datagrams with no `_project`, or
+   with a `_project` that matches no registered pipeline and carried no
+   `_token` to register one, are dropped here.
 5. **Shutdown grace exhausted** (`drops.shutdown`) — events still in
    flight (or queued behind a wedged POST) when
    `MESH0_SHUTDOWN_GRACE_MS` elapses are abandoned and counted.

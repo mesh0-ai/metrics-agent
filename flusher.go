@@ -65,7 +65,6 @@ func postJSON(parent context.Context, client *http.Client, url, apiKey string, b
 type eventsFlusher struct {
 	in            <-chan EventBatch
 	url           string
-	apiKey        string
 	httpClient    *http.Client
 	log           *slog.Logger
 	stats         *selfStats
@@ -78,14 +77,9 @@ type eventsFlusher struct {
 }
 
 func newEventsFlusher(in <-chan EventBatch, cfg Config, log *slog.Logger, stats *selfStats) *eventsFlusher {
-	return newEventsFlusherWithKey(in, cfg, cfg.APIKey, log, stats)
-}
-
-func newEventsFlusherWithKey(in <-chan EventBatch, cfg Config, apiKey string, log *slog.Logger, stats *selfStats) *eventsFlusher {
 	return &eventsFlusher{
 		in:         in,
 		url:        cfg.GatewayURL + cfg.EventsPath,
-		apiKey:     apiKey,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		log:        log,
 		stats:      stats,
@@ -131,13 +125,10 @@ func (f *eventsFlusher) send(batch EventBatch) {
 				goto fail
 			}
 		}
-		// The batch's own credential when it carried one, else the
-		// pipeline's configured key. Empty Token is the keys-file path.
-		key := f.apiKey
-		if batch.Token != "" {
-			key = batch.Token
-		}
-		err := postJSON(f.ctx, f.httpClient, f.url, key, body)
+		// The batch's own credential. It is the ONLY credential: dispatch
+		// drops any datagram that arrives without a `_token`, so a batch
+		// reaching here always carries one.
+		err := postJSON(f.ctx, f.httpClient, f.url, batch.Token, body)
 		if err == nil {
 			f.stats.BatchesSent.Add(1)
 			f.stats.EventsSent.Add(uint64(len(batch.Events)))

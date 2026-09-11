@@ -18,8 +18,6 @@ var Version = "dev"
 // Config is the agent's runtime knobs. All come from the environment so the
 // container ships with no flags to remember.
 type Config struct {
-	APIKey        string
-	KeysFile      string
 	GatewayURL    string
 	EventsPath    string
 	ListenPath    string
@@ -31,58 +29,24 @@ type Config struct {
 	MaxRetries    int
 	ShutdownGrace time.Duration
 	LogLevel      slog.Level
-	// MaxProjects bounds the number of registered pipelines (including the
-	// MESH0_API_KEY fallback). Each pipeline owns a per-project queue, two
-	// goroutines, and an http.Client — worst-case in-flight memory is
-	// MaxProjects * QueueSize * MaxEventBytes.
+	// MaxProjects bounds the number of registered pipelines. Each pipeline
+	// owns a per-project queue, two goroutines, and an http.Client —
+	// worst-case in-flight memory is MaxProjects * QueueSize * MaxEventBytes.
 	//
-	// 0 means UNLIMITED and is the default. The cap exists to stop a
-	// MISCONFIGURED keys file (e.g. one entry per request_id) spawning
-	// unbounded goroutines, but it defends against a shape of bug that has
-	// not occurred while reliably breaking a legitimate one that has: a
-	// keys file is written wholesale by a control plane, so a real
-	// deployment with more projects than the cap has its ENTIRE file
-	// rejected and routes nothing at all. Silence for every project is a
-	// worse failure than the memory growth the ceiling was guarding, and it
-	// is not self-announcing on the caller's side.
-	//
-	// Deployments that want the guard set MESH0_MAX_PROJECTS to a positive
-	// value and size it against their own keys file.
+	// 0 means UNLIMITED and is the default. The cap guards against a caller
+	// minting a distinct `_project` per request (e.g. one per request_id)
+	// and spawning unbounded goroutines. Since every registration requires a
+	// valid `_token`, reaching a sane cap means an emitter is misbehaving.
 	MaxProjects int
-	// KeysPollInterval is how often the agent re-reads MESH0_KEYS_FILE on
-	// its own, independent of SIGHUP. On Kubernetes the Secret volume
-	// propagates asynchronously (up to ~a minute after the API write), so an
-	// external SIGHUP sent right after the write can reload stale contents
-	// and never be retried; polling guarantees eventual pickup. 0 disables
-	// polling (SIGHUP-only). Ignored when MESH0_KEYS_FILE is unset.
-	KeysPollInterval time.Duration
-	// RequireProject disables the MESH0_API_KEY fallback for datagrams
-	// arriving without a `_project` field. Recommended for multi-tenant
-	// deployments to surface mis-tagged callers as `unrouted_missing_project`
-	// rather than silently cross-attributing to whatever tenant owns the
-	// default key.
-	RequireProject bool
-
-	// InlineTokens honors a per-datagram `_token` credential: it authorizes
-	// that datagram's batch, and a project seen only via such a datagram is
-	// registered on demand without a keys-file entry.
-	//
-	// DEFAULT ON, and that is a no-op for existing deployments: a datagram
-	// that carries no `_token` takes exactly the path it took before, and a
-	// project can only be auto-registered by a caller that presented a
-	// credential for it. Set MESH0_INLINE_TOKENS=0 to refuse inline
-	// credentials outright.
-	InlineTokens bool
-	// InlineIdle retires an inline-registered pipeline after this long
-	// without traffic. Keys-file pipelines are never expired — an operator
-	// declared those. 0 disables expiry.
+	// InlineIdle retires a registered pipeline after this long without
+	// traffic. Every pipeline is registered on demand from a `_token`, so
+	// this is what bounds the population for deployments whose projects turn
+	// over. 0 disables expiry.
 	InlineIdle time.Duration
 }
 
 func loadConfig() (Config, error) {
 	c := Config{
-		APIKey:        os.Getenv("MESH0_API_KEY"),
-		KeysFile:      os.Getenv("MESH0_KEYS_FILE"),
 		GatewayURL:    envOr("MESH0_BASE_URL", "https://api.mesh0.ai"),
 		EventsPath:    envOr("MESH0_EVENTS_PATH", "/v1/events"),
 		ListenPath:    envOr("MESH0_LISTEN_PATH", "/run/mesh0/agent.sock"),
@@ -93,14 +57,12 @@ func loadConfig() (Config, error) {
 		// Per-pipeline default. Multi-tenant deployments register one
 		// pipeline per project, so the process-wide ceiling is
 		// (QueueSize * registered projects).
-		QueueSize:        2_000,
-		MaxRetries:       4,
-		ShutdownGrace:    15 * time.Second,
-		LogLevel:         slog.LevelInfo,
-		MaxProjects:      0,
-		KeysPollInterval: 30 * time.Second,
-		InlineTokens:     true,
-		InlineIdle:       15 * time.Minute,
+		QueueSize:     2_000,
+		MaxRetries:    4,
+		ShutdownGrace: 15 * time.Second,
+		LogLevel:      slog.LevelInfo,
+		MaxProjects:   0,
+		InlineIdle:    15 * time.Minute,
 	}
 	if v := os.Getenv("MESH0_BATCH_WINDOW_MS"); v != "" {
 		ms, err := strconv.Atoi(v)
@@ -154,23 +116,6 @@ func loadConfig() (Config, error) {
 		}
 		c.MaxProjects = n
 	}
-	if v := os.Getenv("MESH0_KEYS_POLL_MS"); v != "" {
-		ms, err := strconv.Atoi(v)
-		if err != nil || ms < 0 || ms > 3_600_000 {
-			return c, fmt.Errorf("MESH0_KEYS_POLL_MS must be an integer in [0, 3600000] (0 disables polling)")
-		}
-		c.KeysPollInterval = time.Duration(ms) * time.Millisecond
-	}
-	if v := os.Getenv("MESH0_INLINE_TOKENS"); v != "" {
-		switch v {
-		case "1", "true", "TRUE":
-			c.InlineTokens = true
-		case "0", "false", "FALSE":
-			c.InlineTokens = false
-		default:
-			return c, fmt.Errorf("MESH0_INLINE_TOKENS must be 0|1|true|false")
-		}
-	}
 	if v := os.Getenv("MESH0_INLINE_IDLE_MS"); v != "" {
 		ms, err := strconv.Atoi(v)
 		// 0 disables expiry; the upper bound is a day, past which "idle" has
@@ -179,16 +124,6 @@ func loadConfig() (Config, error) {
 			return c, fmt.Errorf("MESH0_INLINE_IDLE_MS must be an integer in [0, 86400000]")
 		}
 		c.InlineIdle = time.Duration(ms) * time.Millisecond
-	}
-	if v := os.Getenv("MESH0_REQUIRE_PROJECT"); v != "" {
-		switch v {
-		case "1", "true", "TRUE":
-			c.RequireProject = true
-		case "0", "false", "FALSE":
-			c.RequireProject = false
-		default:
-			return c, fmt.Errorf("MESH0_REQUIRE_PROJECT must be 1|0|true|false")
-		}
 	}
 	if v := os.Getenv("MESH0_LOG_LEVEL"); v != "" {
 		switch v {
@@ -204,13 +139,6 @@ func loadConfig() (Config, error) {
 			return c, fmt.Errorf("MESH0_LOG_LEVEL must be debug|info|warn|error")
 		}
 	}
-	// An inline-token deployment declares nothing up front — the credential
-	// arrives on the datagram — so it legitimately has neither knob set. The
-	// guard still applies when inline tokens are disabled, where having
-	// neither really does mean the agent can authenticate nothing.
-	if c.APIKey == "" && c.KeysFile == "" && !c.InlineTokens {
-		return c, errors.New("set MESH0_API_KEY (single-tenant), MESH0_KEYS_FILE (multi-tenant), or enable MESH0_INLINE_TOKENS")
-	}
 	if c.ListenPath == "" {
 		return c, errors.New("MESH0_LISTEN_PATH is required")
 	}
@@ -221,6 +149,33 @@ func loadConfig() (Config, error) {
 		return c, fmt.Errorf("MESH0_LISTEN_PATH must be <= 103 bytes (got %d)", len(c.ListenPath))
 	}
 	return c, nil
+}
+
+// retiredEnv names the credential knobs that existed before routing became
+// `_token`-only. They are no longer read at all.
+//
+// They are WARNED about rather than silently ignored, and rather than made
+// fatal. Silence is wrong because a manifest still setting MESH0_KEYS_FILE
+// looks configured to whoever reads it while doing nothing — the exact class
+// of confusion that hid the reload bug this removal fixes. Fatal is wrong
+// because it would turn a harmless leftover in a chart into a crash loop
+// during the rollout that removes it.
+var retiredEnv = []string{
+	"MESH0_API_KEY",
+	"MESH0_KEYS_FILE",
+	"MESH0_KEYS_POLL_MS",
+	"MESH0_INLINE_TOKENS",
+	"MESH0_REQUIRE_PROJECT",
+}
+
+// warnRetiredEnv logs any retired knob still present in the environment.
+func warnRetiredEnv(log *slog.Logger) {
+	for _, k := range retiredEnv {
+		if os.Getenv(k) != "" {
+			log.Warn("ignoring retired environment variable; routing is inline-token only",
+				"env", k)
+		}
+	}
 }
 
 func envOr(k, def string) string {
@@ -237,6 +192,7 @@ func main() {
 		os.Exit(2)
 	}
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
+	warnRetiredEnv(log)
 	log.Info("starting mesh0 metrics agent",
 		"version", Version,
 		"listen", cfg.ListenPath,
@@ -245,9 +201,6 @@ func main() {
 		"max_batch", cfg.MaxBatch,
 		"max_event_bytes", cfg.MaxEventBytes,
 		"queue_size", cfg.QueueSize,
-		"keys_file", cfg.KeysFile,
-		"keys_poll", cfg.KeysPollInterval,
-		"inline_tokens", cfg.InlineTokens,
 		"inline_idle", cfg.InlineIdle,
 	)
 
@@ -264,40 +217,9 @@ func main() {
 
 	healthSrv := startHealthServer(cfg.HealthAddr, stats, reg, log)
 
-	// SIGHUP reloads the keys file. Done on a separate signal channel so it
-	// doesn't compete with the SIGINT/SIGTERM shutdown context above.
-	hupCh := make(chan os.Signal, 1)
-	signal.Notify(hupCh, syscall.SIGHUP)
-	defer signal.Stop(hupCh)
-	// The keys file is also re-read on a timer: an external SIGHUP can race
-	// the async Secret-volume propagation on Kubernetes (reload the old
-	// contents and never fire again), and a sidecar that started before keys
-	// were provisioned would otherwise run keyless until restart. reload() is
-	// a quiet no-op when the file is unchanged, so the tick is cheap.
-	var pollCh <-chan time.Time
-	if cfg.KeysFile != "" && cfg.KeysPollInterval > 0 {
-		ticker := time.NewTicker(cfg.KeysPollInterval)
-		defer ticker.Stop()
-		pollCh = ticker.C
-	}
-	hupDone := make(chan struct{})
-	go func() {
-		defer close(hupDone)
-		for {
-			select {
-			case <-hupCh:
-				reg.reload()
-			case <-pollCh:
-				reg.reload()
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	// Inline-pipeline idle expiry. Only meaningful when inline registration
-	// can happen at all; a keys-file-only deployment never creates one.
-	if cfg.InlineTokens && cfg.InlineIdle > 0 {
+	// Idle expiry. Every pipeline is registered on demand from a `_token`,
+	// so this is the only thing bounding the population.
+	if cfg.InlineIdle > 0 {
 		expiryStop := make(chan struct{})
 		defer close(expiryStop)
 		go reg.runInlineExpiry(cfg.InlineIdle, expiryStop)
@@ -317,8 +239,6 @@ func main() {
 		}
 		cancel()
 	}
-
-	<-hupDone
 
 	reg.shutdown(cfg.ShutdownGrace)
 

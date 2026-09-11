@@ -17,7 +17,7 @@ import (
 func newTestEventsFlusher(t *testing.T, url string, maxRetries int) (*eventsFlusher, *selfStats) {
 	t.Helper()
 	stats := newSelfStats()
-	cfg := Config{GatewayURL: url, EventsPath: "/v1/events", APIKey: "k", MaxRetries: maxRetries}
+	cfg := Config{GatewayURL: url, EventsPath: "/v1/events", MaxRetries: maxRetries}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	in := make(chan EventBatch, 1)
 	f := newEventsFlusher(in, cfg, log, stats)
@@ -30,7 +30,8 @@ func sampleEventBatch(n int) EventBatch {
 	for i := 0; i < n; i++ {
 		evs[i] = json.RawMessage(`{"operation":"test"}`)
 	}
-	return EventBatch{Events: evs, StartedAt: time.Unix(1700000000, 0)}
+	// Every batch carries its own credential -- it is the only one there is.
+	return EventBatch{Events: evs, StartedAt: time.Unix(1700000000, 0), Token: "k"}
 }
 
 func TestEventsFlusherSuccess(t *testing.T) {

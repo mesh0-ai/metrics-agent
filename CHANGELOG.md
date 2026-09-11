@@ -2,6 +2,50 @@
 
 All notable changes to this project are documented here.
 
+## 0.5.0
+
+**Breaking: routing is `_token`-only. The keys file is gone.**
+
+- **Removed: `MESH0_API_KEY`, `MESH0_KEYS_FILE`, `MESH0_KEYS_POLL_MS`,
+  `MESH0_INLINE_TOKENS`, `MESH0_REQUIRE_PROJECT`**, the `_default` sentinel
+  project, and the `SIGHUP` reload. Every pipeline is now registered on demand
+  from a datagram's own `_token`; the agent starts with an empty routing table
+  and holds no credential of its own. Retired variables are **ignored with a
+  warning rather than being fatal**, so a chart that still sets one keeps
+  booting through the rollout that removes it.
+
+- **Fixed: a keys-file poll tore down every inline-registered pipeline.**
+  `reload()` rebuilt the whole routing table from the keys file and then
+  drained any pipeline absent from the rebuild. Pipelines registered from a
+  `_token` are absent by construction — they are not declared anywhere — so an
+  agent configured with `MESH0_KEYS_FILE` pointing at an empty `{}` destroyed
+  every live pipeline on every poll (default every 30s) and dropped each one's
+  buffered batches as `drops.shutdown`. Observed on a production cluster as
+  **11.8M `shutdown` drops against 28.4M events received**, with the log
+  looping `routing reloaded projects:[]` followed immediately by
+  `inline project registered from datagram credential` for the same projects.
+
+  Removing the keys file removes the mechanism: registration is now purely
+  additive and nothing but idle expiry (`MESH0_INLINE_IDLE_MS`) removes a
+  pipeline. Pinned by
+  `TestRegistry_RegistrationIsAdditiveAndNeverRetiresLivePipelines`.
+
+- **Removed from `/stats`: `keys_reload_failures` and `last_keys_reload_unix`.**
+  Both described the reload path and are meaningless without it. They were
+  already `omitempty`, so they simply stop appearing.
+
+- Pipelines no longer carry a fallback API key, so a batch is authorized only
+  by the token that arrived with its events. `drops.missing_token` now applies
+  to every pipeline (previously keys-file pipelines were exempt).
+
+### Upgrading
+
+Drop `MESH0_API_KEY` / `MESH0_KEYS_FILE` (and any keys-file Secret and its
+volume mount) from your manifests. Emitters must send `_token` on every
+datagram — an emitter still relying on a keys-file credential will have its
+events dropped as `drops.missing_token` or `drops.unrouted_unknown_project`.
+Watch those two counters plus `inline_projects_live` after rollout.
+
 ## 0.4.0
 
 - **Added: inline per-datagram credentials (`_token`).** A datagram may carry
