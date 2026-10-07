@@ -4,6 +4,13 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- **Fixed: per-project queue overflows were invisible at the top level.** A
+  full per-project handoff buffer was counted only in `by_project`, so the
+  top-level `events_dropped` read zero while one project lost events. It is
+  now also counted in the new top-level `events_dropped.pipeline_queue_full`
+  (the per-project total). The top-level `queue_full` still means the shared
+  queue only.
+
 - **Fixed: a 2xx that accepted nothing was counted as delivered.** `postJSON`
   returned success for any 2xx without reading the body, so a batch mesh0
   answered `202 {"status":"provisioning","accepted":0}` ("dropped, keep

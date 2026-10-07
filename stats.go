@@ -15,6 +15,11 @@ type selfStats struct {
 	BatchesSent      atomic.Uint64
 	DropsParseError  atomic.Uint64
 	DropsQueueFull   atomic.Uint64
+	// DropsPipelineQueueFull is the process-wide total of per-project
+	// handoff overflows (the sum of by_project queue_full). DropsQueueFull
+	// above counts only the SHARED queue; before this counter existed a
+	// per-project overflow was invisible at the top level.
+	DropsPipelineQueueFull atomic.Uint64
 	DropsOversize    atomic.Uint64
 	DropsFlushFailed atomic.Uint64
 	// DropsNotAccepted counts events the gateway answered 2xx for but did
@@ -94,6 +99,10 @@ type statsSnapshot struct {
 type dropStats struct {
 	ParseError      uint64 `json:"parse_error"`
 	QueueFull       uint64 `json:"queue_full"`
+	// PipelineQueueFull is top-level only: the per-project overflows,
+	// summed. Zero (and omitted) in a by_project entry, whose own
+	// queue_full already is that project's overflow.
+	PipelineQueueFull uint64 `json:"pipeline_queue_full,omitempty"`
 	Oversize        uint64 `json:"oversize"`
 	FlushFailed     uint64 `json:"flush_failed"`
 	NotAccepted     uint64 `json:"not_accepted"`
@@ -115,7 +124,7 @@ type dropStats struct {
 //	  Σ pipelineStats.EventsReceived                  (events accepted into a pipeline)
 //	+ Σ pipelineStats.DropsParseError                 (batcher-level structural drops)
 //	+ Σ pipelineStats.DropsOversize
-//	+ Σ pipelineStats.DropsQueueFull
+//	+ Σ pipelineStats.DropsQueueFull                  (== selfStats.DropsPipelineQueueFull)
 //	+ Σ pipelineStats.DropsRoutingClosed
 //	+ selfStats.DropsParseError                       (routing-strip malformed)
 //	+ selfStats.DropsUnroutedMissing
@@ -191,8 +200,9 @@ func (s *selfStats) snapshot() statsSnapshot {
 	return statsSnapshot{
 		EventsReceived: s.EventsReceived.Load(),
 		EventsDropped: dropStats{
-			ParseError:      s.DropsParseError.Load(),
-			QueueFull:       s.DropsQueueFull.Load(),
+			ParseError:        s.DropsParseError.Load(),
+			QueueFull:         s.DropsQueueFull.Load(),
+			PipelineQueueFull: s.DropsPipelineQueueFull.Load(),
 			Oversize:        s.DropsOversize.Load(),
 			FlushFailed:     s.DropsFlushFailed.Load(),
 			NotAccepted:     s.DropsNotAccepted.Load(),

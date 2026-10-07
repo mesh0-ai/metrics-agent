@@ -345,13 +345,16 @@ func (r *registry) demux() {
 			p.stats.DropsRoutingClosed.Add(1)
 			r.processStats.DropsRoutingClosed.Add(1)
 		case full:
-			// Per-project handoff buffer overflow. Reserved for the
-			// pipeline's own counter — the shared-queue overflow path
-			// (process-wide DropsQueueFull) is bumped at dispatch when
-			// sharedRawCh itself is full. Distinguishing the two lets
-			// operators tell "the whole agent is back-pressured" from
-			// "this one project's batcher/flusher is stuck."
+			// Per-project handoff buffer overflow. Counted on the
+			// pipeline's own queue_full AND on the process-wide
+			// pipeline_queue_full, so a top-level alert sees it. It is
+			// deliberately NOT the process-wide DropsQueueFull, which the
+			// listener bumps when sharedRawCh itself is full: keeping the
+			// two apart lets operators tell "the whole agent is
+			// back-pressured" from "this one project's batcher/flusher is
+			// stuck."
 			p.stats.DropsQueueFull.Add(1)
+			r.processStats.DropsPipelineQueueFull.Add(1)
 		}
 	}
 }

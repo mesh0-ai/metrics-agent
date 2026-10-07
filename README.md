@@ -400,9 +400,11 @@ it. Four loss points, all observable in `/stats`:
    queue between the listener and the demuxer is bounded by
    `MESH0_QUEUE_SIZE`. The listener never blocks; if the demuxer is
    behind, the newest datagram is dropped. Per-project `queue_full`
-   (only visible in `by_project`, not the top-level counter) indicates
-   one project's 16-slot handoff buffer is full while the shared queue
-   still has capacity — a single project's batcher/flusher is wedged.
+   (in `by_project`, and summed at the top level as
+   `pipeline_queue_full`) indicates one project's 16-slot handoff buffer
+   is full while the shared queue still has capacity — a single project's
+   batcher/flusher is wedged. The top-level `queue_full` counts the shared
+   queue only.
 3. **Flush failures** (`drops.flush_failed`) — gateway 4xx (non-429),
    or 429/5xx after `MESH0_MAX_RETRIES`. **Not accepted**
    (`drops.not_accepted`) — the gateway answered 2xx but accepted none of
