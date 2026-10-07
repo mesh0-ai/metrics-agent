@@ -17,6 +17,12 @@ type selfStats struct {
 	DropsQueueFull   atomic.Uint64
 	DropsOversize    atomic.Uint64
 	DropsFlushFailed atomic.Uint64
+	// DropsNotAccepted counts events the gateway answered 2xx for but did
+	// not accept: a batch refused until retries ran out (mesh0's
+	// `202 {"accepted":0}` while a project provisions), or the shortfall of
+	// a partial acceptance. Distinct from flush_failed: the gateway is
+	// reachable and answering, it is refusing these events.
+	DropsNotAccepted atomic.Uint64
 	DropsShutdown    atomic.Uint64
 	// DropsUnroutedMissing counts datagrams dropped because no `_project`
 	// was set and no DefaultProject pipeline is registered (multi-tenant
@@ -90,6 +96,7 @@ type dropStats struct {
 	QueueFull       uint64 `json:"queue_full"`
 	Oversize        uint64 `json:"oversize"`
 	FlushFailed     uint64 `json:"flush_failed"`
+	NotAccepted     uint64 `json:"not_accepted"`
 	Shutdown        uint64 `json:"shutdown"`
 	RoutingClosed   uint64 `json:"routing_closed,omitempty"`
 	UnroutedMissing uint64 `json:"unrouted_missing_project,omitempty"`
@@ -129,6 +136,7 @@ type pipelineStats struct {
 	DropsMissingToken  atomic.Uint64
 	DropsOversize      atomic.Uint64
 	DropsFlushFailed   atomic.Uint64
+	DropsNotAccepted   atomic.Uint64
 	DropsShutdown      atomic.Uint64
 	LastEventFlushMs   atomic.Int64
 }
@@ -161,6 +169,7 @@ func (s *pipelineStats) snapshot() projectStatsSnapshot {
 			QueueFull:     s.DropsQueueFull.Load(),
 			Oversize:      s.DropsOversize.Load(),
 			FlushFailed:   s.DropsFlushFailed.Load(),
+			NotAccepted:   s.DropsNotAccepted.Load(),
 			Shutdown:      s.DropsShutdown.Load(),
 			RoutingClosed: s.DropsRoutingClosed.Load(),
 			MissingToken:  s.DropsMissingToken.Load(),
@@ -186,6 +195,7 @@ func (s *selfStats) snapshot() statsSnapshot {
 			QueueFull:       s.DropsQueueFull.Load(),
 			Oversize:        s.DropsOversize.Load(),
 			FlushFailed:     s.DropsFlushFailed.Load(),
+			NotAccepted:     s.DropsNotAccepted.Load(),
 			Shutdown:        s.DropsShutdown.Load(),
 			RoutingClosed:   s.DropsRoutingClosed.Load(),
 			UnroutedMissing: s.DropsUnroutedMissing.Load(),

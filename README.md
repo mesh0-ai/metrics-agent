@@ -95,7 +95,15 @@ Content-Type: application/json
 Body: {"events":[{...}, ...]}
 ```
 
-- `200 {accepted: N}` — all good
+- `200 {accepted: N}` — N of the batch's events delivered. A partial count
+  is not retried (the gateway does not say which events it kept, so a retry
+  would duplicate them); the shortfall is counted as `drops.not_accepted`.
+- `2xx` with `accepted: 0`, or a `202` with no `accepted` — mesh0's
+  "dropped, keep sending" (open-mode admission answers
+  `202 {"status":"provisioning","accepted":0}` while a project provisions).
+  Retried with backoff from 1s; when `MESH0_MAX_RETRIES` runs out the batch
+  is counted as `drops.not_accepted`, never as sent.
+- `2xx` whose body carries no numeric `accepted` — all delivered.
 - `4xx` (other than 429) — log + drop batch, no retry
 - `429` / `5xx` — retry with exponential backoff + jitter
   (250ms × 2^attempt, capped at 5s, ±50% jitter), drop after
@@ -343,7 +351,7 @@ The agent exposes a small HTTP server on `MESH0_HEALTH_ADDR` (default `:8126`):
   ```json
   {
     "events_received":   123456,
-    "events_dropped":    {"parse_error": 12, "queue_full": 3, "oversize": 0, "flush_failed": 0, "shutdown": 0, "routing_closed": 0, "unrouted_missing_project": 0, "unrouted_unknown_project": 0, "bad_token": 0, "missing_token": 0},
+    "events_dropped":    {"parse_error": 12, "queue_full": 3, "oversize": 0, "flush_failed": 0, "not_accepted": 0, "shutdown": 0, "routing_closed": 0, "unrouted_missing_project": 0, "unrouted_unknown_project": 0, "bad_token": 0, "missing_token": 0},
     "batches_sent":      247,
     "events_sent":       123087,
     "last_flush_age_ms": 180,
@@ -354,7 +362,7 @@ The agent exposes a small HTTP server on `MESH0_HEALTH_ADDR` (default `:8126`):
     "by_project": {
       "workspace-42": {
         "events_received": 89000, "events_sent": 88950, "batches_sent": 178,
-        "events_dropped":  {"parse_error": 0, "queue_full": 0, "oversize": 0, "flush_failed": 50, "shutdown": 0, "routing_closed": 0},
+        "events_dropped":  {"parse_error": 0, "queue_full": 0, "oversize": 0, "flush_failed": 50, "not_accepted": 0, "shutdown": 0, "routing_closed": 0},
         "last_flush_age_ms": 180
       }
     }
@@ -396,7 +404,9 @@ it. Four loss points, all observable in `/stats`:
    one project's 16-slot handoff buffer is full while the shared queue
    still has capacity — a single project's batcher/flusher is wedged.
 3. **Flush failures** (`drops.flush_failed`) — gateway 4xx (non-429),
-   or 429/5xx after `MESH0_MAX_RETRIES`.
+   or 429/5xx after `MESH0_MAX_RETRIES`. **Not accepted**
+   (`drops.not_accepted`) — the gateway answered 2xx but accepted none of
+   the batch until retries ran out, or only part of it.
 4. **Unrouted** (`drops.unrouted_missing_project`,
    `drops.unrouted_unknown_project`) — multi-tenant only. Datagrams with
    no `_project` (and no `MESH0_API_KEY` fallback) or with a `_project`

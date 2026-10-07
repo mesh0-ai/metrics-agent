@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## Unreleased
+
+- **Fixed: a 2xx that accepted nothing was counted as delivered.** `postJSON`
+  returned success for any 2xx without reading the body, so a batch mesh0
+  answered `202 {"status":"provisioning","accepted":0}` ("dropped, keep
+  sending") was added to `events_sent` and never retried. The flusher now
+  reads `accepted`: zero is retried (backoff from 1s, since what clears it is
+  a project finishing provisioning), and a batch still refused when retries
+  run out is counted under the new `drops.not_accepted` (top level and
+  `by_project`). A partial acceptance delivers that many and counts the
+  shortfall as `not_accepted` without retrying, since a retry would duplicate
+  the accepted events. A 2xx without a numeric `accepted` keeps its old
+  meaning.
+
 ## 0.4.0
 
 - **Added: inline per-datagram credentials (`_token`).** A datagram may carry
