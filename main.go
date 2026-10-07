@@ -95,7 +95,10 @@ func loadConfig() (Config, error) {
 		ListenPath:    envOr("MESH0_LISTEN_PATH", "/run/mesh0/agent.sock"),
 		HealthAddr:    envOr("MESH0_HEALTH_ADDR", ":8126"),
 		BatchWindow:   200 * time.Millisecond,
-		MaxBatch:      500,
+		// 2000 of the gateway's 5000: under load the old 500 capped every
+		// POST, so the default set the POST rate. Bodies stay within
+		// MaxBatchBytes (10 MB), which pre-flushes a batch of large events.
+		MaxBatch:      2000,
 		MaxEventBytes: DefaultMaxEventBytes,
 		// Per-pipeline default. Multi-tenant deployments register one
 		// pipeline per project, so the process-wide ceiling is

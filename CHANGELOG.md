@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- **Changed: `MESH0_MAX_BATCH` defaults to 2000 (was 500).** Under sustained
+  load every POST was capped at exactly 500 events, so the default set the
+  POST rate. A batch still pre-flushes at the 10 MB body limit, and a
+  deployment that wants the old size sets it explicitly.
+
 - **Added: multi-event datagrams (`m0batch/1`).** One datagram may carry one
   routing header and up to 5000 events (`M0BATCH/1\n{"_project","_token",
   "events":[…]}`), so an emitter that produces many small events per request
