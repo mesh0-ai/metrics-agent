@@ -37,8 +37,11 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.BatchWindow != 200*time.Millisecond {
 		t.Errorf("BatchWindow default: got %v", cfg.BatchWindow)
 	}
-	if cfg.MaxBatch != 500 {
-		t.Errorf("MaxBatch default: got %d", cfg.MaxBatch)
+	// 2000, not 500: under load the agent's POSTs were capped at exactly 500
+	// events (the perf study's functions shape: 270,073 events in 541
+	// batches), so the default, not the window, set the POST rate.
+	if cfg.MaxBatch != 2000 {
+		t.Errorf("MaxBatch default: got %d, want 2000", cfg.MaxBatch)
 	}
 	if cfg.QueueSize != 2_000 {
 		t.Errorf("QueueSize default: got %d", cfg.QueueSize)
