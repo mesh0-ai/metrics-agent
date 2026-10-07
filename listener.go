@@ -43,6 +43,19 @@ type listenSink interface {
 }
 
 func listen(ctx context.Context, path string, readBufSize int, sink listenSink, log *slog.Logger, stats *selfStats) error {
+	return listenWithOptions(ctx, path, readBufSize, sink, log, stats, listenOptions{})
+}
+
+// listenOptions are the listener's optional behaviors.
+type listenOptions struct {
+	// advertiseBatch writes `<path>.caps` (batch.go) once the socket is
+	// bound, so emitters may send multi-event datagrams, and removes it on
+	// exit. Off, any stale advertisement at that path is removed at bind,
+	// since an emitter reading it would send batches this agent refuses.
+	advertiseBatch bool
+}
+
+func listenWithOptions(ctx context.Context, path string, readBufSize int, sink listenSink, log *slog.Logger, stats *selfStats, opts listenOptions) error {
 	if path == "" {
 		return errors.New("MESH0_LISTEN_PATH is empty")
 	}
@@ -53,11 +66,36 @@ func listen(ctx context.Context, path string, readBufSize int, sink listenSink, 
 		readBufSize = DefaultMaxEventBytes + 1
 	}
 
+	// Any advertisement already at this path describes a socket that no
+	// longer exists (an earlier run, possibly a different agent build). It
+	// goes before the new socket appears, so no emitter can pair the new
+	// socket with a stale file.
+	if err := removeCapsFile(path); err != nil {
+		log.Warn("could not remove a stale capability file", "path", capsPath(path), "err", err)
+	}
+
 	conn, cleanup, err := bindUnixgram(path, log, stats)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
+
+	// The advertisement is written after the bind (it names the bound
+	// socket's inode) and withdrawn before the socket is unlinked (deferred
+	// after cleanup, so it runs first). A failure to write it is not fatal:
+	// emitters just keep sending single datagrams.
+	if opts.advertiseBatch {
+		if err := writeCapsFile(path, readBufSize-1); err != nil {
+			log.Warn("could not advertise batch datagrams; emitters will send single events", "err", err)
+		} else {
+			log.Info("advertising batch datagrams", "caps", capsPath(path), "format", batchFormatV1)
+		}
+		defer func() {
+			if err := removeCapsFile(path); err != nil {
+				log.Warn("capability file cleanup failed", "path", capsPath(path), "err", err)
+			}
+		}()
+	}
 
 	// Pool sized to the configured read buffer; one listener exists per
 	// process, so this effectively holds a single buffer reused across reads.

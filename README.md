@@ -86,6 +86,45 @@ finish_reason    string
 prompt           { system, messages, prompt }
 ```
 
+### Multi-event datagrams (`m0batch/1`)
+
+An emitter that sends many small events per request may pack them into one
+datagram: one routing header and N events.
+
+```
+M0BATCH/1
+{"_project":"workspace-1","_token":"eyJ…","events":[{…},{…}]}
+```
+
+- The first line is the magic and the format version, deliberately not JSON:
+  an agent that predates the format drops the datagram as one `parse_error`
+  instead of forwarding a wrapped object.
+- `_project` / `_token` route and authorize every event exactly as on a single
+  datagram (both optional). No other header member is accepted.
+- Each event is a JSON object handled exactly like a single datagram's (size
+  cap, `timestamp` stamping, `MESH0_MAX_BATCH`). A member's own `_token` is
+  stripped and ignored; a member `_project` must equal the header's, else that
+  member drops as `parse_error`.
+- At most 5000 events, and the whole datagram within `MESH0_MAX_EVENT_BYTES`.
+- Accounting is per event: `events_received`, every routing drop and
+  `queue_full` count each event; an unparseable batch is one `parse_error`.
+  `/stats` also reports `batch_datagrams_received`.
+
+**Only send one when the agent advertises it.** On bind the agent writes
+`<MESH0_LISTEN_PATH>.caps` (mode 0644) and removes it on exit:
+
+```json
+{"agent":"mesh0-metrics-agent","version":"0.5.0","formats":["m0batch/1"],
+ "max_datagram_bytes":1048576,"max_batch_events":5000,
+ "socket":{"dev":64769,"ino":1234567}}
+```
+
+An emitter should use batches only when `formats` lists `m0batch/1` AND
+`socket.dev`/`socket.ino` equal `stat()` of the socket path it connects to,
+re-checking whenever it reconnects. The inode check is what keeps a file left
+behind by a replaced agent from being trusted. `MESH0_BATCH_DATAGRAMS=0`
+withdraws the advertisement and refuses batches.
+
 ## Backend contract (agent → mesh0)
 
 ```
@@ -209,6 +248,7 @@ All knobs are environment variables.
 | `MESH0_MAX_PROJECTS`      | `0` (unlimited)        | Cap on registered pipelines (incl. `_default`). Range `[0, 4096]`; **`0` disables the cap** and is the default. Each pipeline costs two goroutines, an `http.Client`, and a 16-slot handoff buffer (`16 × MAX_EVENT_BYTES` worst case), so a cap guards against a misconfigured keys file with one entry per request-id. It is **off by default because the failure mode is all-or-nothing**: a keys file is written wholesale by a control plane, so a legitimate file that exceeds the cap has its *entire* contents rejected and the agent routes nothing at all — `install` fails fast, and a reload is rejected, keeps the previous table, and bumps `keys_reload_failures`. Set a positive value only if you want that guard and have sized it against your own keys file. |
 | `MESH0_INLINE_TOKENS`     | `true`                 | Honor a per-datagram `_token` credential: it authorizes that datagram's batch, and a project seen only via such a datagram is registered on demand without a keys-file entry. Default-on is a no-op for deployments that never send the field, and a project can only be auto-registered by a caller that presented a credential for it. Set `0` to refuse inline credentials — the field is still stripped from the body. When enabled, neither `MESH0_API_KEY` nor `MESH0_KEYS_FILE` is required at startup. See [Inline credentials](#inline-credentials-_token). |
 | `MESH0_INLINE_IDLE_MS`    | `900000` (15m)         | Retire an on-demand `_token` pipeline after this long without traffic. Range `[0, 86400000]`; `0` disables expiry. Keys-file pipelines are never expired. Bounds memory for deployments that churn through ephemeral projects, where the population turns over rather than growing — watch `inline_projects_registered` / `inline_projects_expired` / `inline_projects_live` in `/stats`. |
+| `MESH0_BATCH_DATAGRAMS`   | `true`                 | Accept multi-event datagrams and advertise them in `<MESH0_LISTEN_PATH>.caps` (see [Multi-event datagrams](#multi-event-datagrams-m0batch1)). Emitters only send them after reading the advertisement, so this is a no-op for those that never do. `0` withdraws the advertisement; a batch then drops as one `parse_error`. |
 | `MESH0_REQUIRE_PROJECT`   | `false`                | When set, datagrams arriving without a `_project` field are **not** routed to the `MESH0_API_KEY` fallback — they drop as `unrouted_missing_project`. Recommended for multi-tenant deployments where silently cross-attributing to the default tenant would be a tagging bug. |
 | `MESH0_LOG_LEVEL`         | `info`                 | `debug` \| `info` \| `warn` \| `error`     |
 

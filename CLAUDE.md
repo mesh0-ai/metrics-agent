@@ -56,7 +56,12 @@ in `selfStats` atomics ([stats.go](stats.go)) or the channels themselves.
 - Local persistence / disk spool. Datagram loss tolerance is the contract.
 - Cross-host transport. The agent and the app must be on the same host —
   if you need a network hop, put a real ingest gateway in front.
-- Any wire format other than JSON-object-per-datagram.
+- Any wire format other than JSON-object-per-datagram, with ONE deliberate
+  exception: the versioned multi-event datagram (`M0BATCH/1\n{…}`,
+  [batch.go](batch.go)), which an emitter may send only after reading the
+  agent's `<listen path>.caps` advertisement. It carries the same JSON events,
+  and every event in it is validated, counted and batched exactly as a single
+  datagram's.
 - TLS termination, mTLS, or auth proxying — the agent is a client of mesh0,
   not a server-facing gateway.
 

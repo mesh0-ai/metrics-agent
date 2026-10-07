@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- **Added: multi-event datagrams (`m0batch/1`).** One datagram may carry one
+  routing header and up to 5000 events (`M0BATCH/1\n{"_project","_token",
+  "events":[…]}`), so an emitter that produces many small events per request
+  pays one send and one credential per batch instead of per event, and the
+  agent one listener/demuxer hop. Every event is still validated, counted and
+  batched on its own; drops are counted per event. The agent advertises the
+  format in `<MESH0_LISTEN_PATH>.caps`, naming the bound socket's dev/inode so
+  a stale file is never trusted, and `MESH0_BATCH_DATAGRAMS=0` turns it off.
+  New `/stats` counter: `batch_datagrams_received`.
+- **Faster event validation.** The top-level `timestamp` lookup walks the
+  object with the routing scanner instead of a `json.Decoder` (falling back to
+  it for anything the scanner refuses), and a batch's events skip the second
+  `json.Valid` pass.
+
 - **Fixed: per-project queue overflows were invisible at the top level.** A
   full per-project handoff buffer was counted only in `by_project`, so the
   top-level `events_dropped` read zero while one project lost events. It is

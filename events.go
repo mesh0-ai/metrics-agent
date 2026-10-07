@@ -51,6 +51,11 @@ type rawDatagram struct {
 	// when the datagram carried none. Deployments that publish a keys file
 	// leave this empty and authenticate from the pipeline's configured key.
 	token string
+	// events is set (and bytes nil) for a batch datagram (batch.go): its
+	// events, routing members stripped, each already valid JSON. It travels
+	// through the shared queue and the handoff as ONE item, so a batch costs
+	// one channel slot, and every drop of it is counted eventCount() times.
+	events [][]byte
 }
 
 // EventBatch is the unit handed to the events flusher. The Events slice is a
@@ -86,6 +91,17 @@ const (
 // (possibly-rewritten) event bytes and a reason code; on validateOK the
 // returned slice is non-nil and ready to append to a batch.
 func validateEvent(b []byte, maxBytes int) (json.RawMessage, validateReason) {
+	return validateEventBytes(b, maxBytes, true)
+}
+
+// validateTrustedEvent is validateEvent for bytes already known to be one
+// valid JSON value (a batch datagram's events): it skips json.Valid, the one
+// step that re-reads the whole event, and keeps every other check.
+func validateTrustedEvent(b []byte, maxBytes int) (json.RawMessage, validateReason) {
+	return validateEventBytes(b, maxBytes, false)
+}
+
+func validateEventBytes(b []byte, maxBytes int, checkSyntax bool) (json.RawMessage, validateReason) {
 	if len(b) > maxBytes {
 		return nil, validateOversize
 	}
@@ -104,7 +120,7 @@ func validateEvent(b []byte, maxBytes int) (json.RawMessage, validateReason) {
 		return nil, validateParseError
 	}
 	trimmed := b[start:end]
-	if !json.Valid(trimmed) {
+	if checkSyntax && !json.Valid(trimmed) {
 		return nil, validateParseError
 	}
 	if !hasTopLevelKey(trimmed, "timestamp") {
@@ -259,6 +275,10 @@ type eventsBatcher struct {
 	curBytes  int
 	curToken  string
 	firstSeen time.Time
+
+	// The window timer. Only run() and the methods it calls touch these.
+	timer  *time.Timer
+	timerC <-chan time.Time
 }
 
 func newEventsBatcher(in <-chan rawDatagram, out chan<- EventBatch, stats *selfStats, log *slog.Logger, maxEvents, maxEventBytes int, window time.Duration) *eventsBatcher {
@@ -283,36 +303,6 @@ func newEventsBatcher(in <-chan rawDatagram, out chan<- EventBatch, stats *selfS
 }
 
 func (b *eventsBatcher) run() {
-	var timer *time.Timer
-	var timerC <-chan time.Time
-
-	armTimer := func(d time.Duration) {
-		if d <= 0 {
-			d = time.Microsecond
-		}
-		if timer == nil {
-			timer = time.NewTimer(d)
-		} else {
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timer.Reset(d)
-		}
-		timerC = timer.C
-	}
-	disarmTimer := func() {
-		timerC = nil
-		if timer != nil && !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-	}
-
 	for {
 		select {
 		case dg, ok := <-b.in:
@@ -320,48 +310,100 @@ func (b *eventsBatcher) run() {
 				b.flush()
 				return
 			}
-			ev, reason := validateEvent(dg.bytes, b.maxEventBytes)
-			switch reason {
-			case validateOversize:
-				b.stats.DropsOversize.Add(1)
-				if b.pipelineStats != nil {
-					b.pipelineStats.DropsOversize.Add(1)
-				}
-				continue
-			case validateParseError:
-				b.stats.DropsParseError.Add(1)
-				if b.pipelineStats != nil {
-					b.pipelineStats.DropsParseError.Add(1)
+			if dg.events != nil {
+				// A batch datagram: its events were decoded out of a body
+				// json.Decoder accepted, so each is already valid JSON and
+				// skips the json.Valid pass. Each is still checked, counted
+				// and batched on its own, so MaxBatch, the byte cap and the
+				// drop counters behave exactly as for single datagrams.
+				for _, ev := range dg.events {
+					b.accept(ev, dg, true)
 				}
 				continue
 			}
-			if b.pipelineStats != nil {
-				b.pipelineStats.EventsReceived.Add(1)
-			}
-			if len(b.cur) > 0 && b.curBytes+len(ev)+1 > MaxBatchBytes {
-				b.flush()
-				disarmTimer()
-			}
-			if len(b.cur) == 0 {
-				b.firstSeen = dg.at
-				armTimer(b.window)
-			}
-			b.cur = append(b.cur, ev)
-			b.curBytes += len(ev) + 1 // comma between elements
-			// Last-wins. A rotation mid-batch leaves the batch carrying the
-			// FRESHER credential, which is the one with more remaining life
-			// against the gateway's clock — the direction that matters when
-			// the flusher retries with backoff.
-			if dg.token != "" {
-				b.curToken = dg.token
-			}
-			if len(b.cur) >= b.maxEvents {
-				b.flush()
-				disarmTimer()
-			}
-		case <-timerC:
+			b.accept(dg.bytes, dg, false)
+		case <-b.timerC:
 			b.flush()
-			disarmTimer()
+			b.disarmTimer()
+		}
+	}
+}
+
+// accept validates one event and appends it to the current batch, flushing
+// on the size and byte caps. trusted skips the json.Valid pass for bytes
+// already known to be one valid JSON value.
+func (b *eventsBatcher) accept(raw []byte, dg rawDatagram, trusted bool) {
+	var ev json.RawMessage
+	var reason validateReason
+	if trusted {
+		ev, reason = validateTrustedEvent(raw, b.maxEventBytes)
+	} else {
+		ev, reason = validateEvent(raw, b.maxEventBytes)
+	}
+	switch reason {
+	case validateOversize:
+		b.stats.DropsOversize.Add(1)
+		if b.pipelineStats != nil {
+			b.pipelineStats.DropsOversize.Add(1)
+		}
+		return
+	case validateParseError:
+		b.stats.DropsParseError.Add(1)
+		if b.pipelineStats != nil {
+			b.pipelineStats.DropsParseError.Add(1)
+		}
+		return
+	}
+	if b.pipelineStats != nil {
+		b.pipelineStats.EventsReceived.Add(1)
+	}
+	if len(b.cur) > 0 && b.curBytes+len(ev)+1 > MaxBatchBytes {
+		b.flush()
+		b.disarmTimer()
+	}
+	if len(b.cur) == 0 {
+		b.firstSeen = dg.at
+		b.armTimer(b.window)
+	}
+	b.cur = append(b.cur, ev)
+	b.curBytes += len(ev) + 1 // comma between elements
+	// Last-wins. A rotation mid-batch leaves the batch carrying the
+	// FRESHER credential, which is the one with more remaining life
+	// against the gateway's clock — the direction that matters when
+	// the flusher retries with backoff.
+	if dg.token != "" {
+		b.curToken = dg.token
+	}
+	if len(b.cur) >= b.maxEvents {
+		b.flush()
+		b.disarmTimer()
+	}
+}
+
+func (b *eventsBatcher) armTimer(d time.Duration) {
+	if d <= 0 {
+		d = time.Microsecond
+	}
+	if b.timer == nil {
+		b.timer = time.NewTimer(d)
+	} else {
+		if !b.timer.Stop() {
+			select {
+			case <-b.timer.C:
+			default:
+			}
+		}
+		b.timer.Reset(d)
+	}
+	b.timerC = b.timer.C
+}
+
+func (b *eventsBatcher) disarmTimer() {
+	b.timerC = nil
+	if b.timer != nil && !b.timer.Stop() {
+		select {
+		case <-b.timer.C:
+		default:
 		}
 	}
 }

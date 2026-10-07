@@ -10,7 +10,14 @@ import (
 // scraping logs. All fields are accessed via atomics so any goroutine can
 // update them on its hot path without locks.
 type selfStats struct {
+	// EventsReceived counts EVENTS: one per single datagram, and a batch
+	// datagram's event count (the listener counts the datagram as one, and
+	// dispatchBatch adds the rest), so the reconciliation below holds either
+	// way.
 	EventsReceived   atomic.Uint64
+	// BatchDatagramsReceived counts multi-event datagrams accepted for
+	// routing (batch.go).
+	BatchDatagramsReceived atomic.Uint64
 	EventsSent       atomic.Uint64
 	BatchesSent      atomic.Uint64
 	DropsParseError  atomic.Uint64
@@ -72,6 +79,9 @@ func newSelfStats() *selfStats {
 // statsSnapshot is the JSON shape of GET /stats.
 type statsSnapshot struct {
 	EventsReceived uint64                          `json:"events_received"`
+	// BatchDatagramsReceived is how many of those arrived in multi-event
+	// datagrams, counted per datagram.
+	BatchDatagramsReceived uint64 `json:"batch_datagrams_received,omitempty"`
 	EventsDropped  dropStats                       `json:"events_dropped"`
 	BatchesSent    uint64                          `json:"batches_sent"`
 	EventsSent     uint64                          `json:"events_sent"`
@@ -198,7 +208,8 @@ func (s *selfStats) snapshot() statsSnapshot {
 		}
 	}
 	return statsSnapshot{
-		EventsReceived: s.EventsReceived.Load(),
+		EventsReceived:         s.EventsReceived.Load(),
+		BatchDatagramsReceived: s.BatchDatagramsReceived.Load(),
 		EventsDropped: dropStats{
 			ParseError:        s.DropsParseError.Load(),
 			QueueFull:         s.DropsQueueFull.Load(),

@@ -77,6 +77,13 @@ type Config struct {
 	// without traffic. Keys-file pipelines are never expired — an operator
 	// declared those. 0 disables expiry.
 	InlineIdle time.Duration
+
+	// BatchDatagrams accepts multi-event datagrams (batch.go) and advertises
+	// them in `<listen path>.caps`. DEFAULT ON: an emitter only sends one
+	// after reading that advertisement, so this changes nothing for one that
+	// does not. Off, the advertisement is withdrawn and a batch datagram is
+	// one parse_error.
+	BatchDatagrams bool
 }
 
 func loadConfig() (Config, error) {
@@ -101,6 +108,7 @@ func loadConfig() (Config, error) {
 		KeysPollInterval: 30 * time.Second,
 		InlineTokens:     true,
 		InlineIdle:       15 * time.Minute,
+		BatchDatagrams:   true,
 	}
 	if v := os.Getenv("MESH0_BATCH_WINDOW_MS"); v != "" {
 		ms, err := strconv.Atoi(v)
@@ -180,6 +188,16 @@ func loadConfig() (Config, error) {
 		}
 		c.InlineIdle = time.Duration(ms) * time.Millisecond
 	}
+	if v := os.Getenv("MESH0_BATCH_DATAGRAMS"); v != "" {
+		switch v {
+		case "1", "true", "TRUE":
+			c.BatchDatagrams = true
+		case "0", "false", "FALSE":
+			c.BatchDatagrams = false
+		default:
+			return c, fmt.Errorf("MESH0_BATCH_DATAGRAMS must be 0|1|true|false")
+		}
+	}
 	if v := os.Getenv("MESH0_REQUIRE_PROJECT"); v != "" {
 		switch v {
 		case "1", "true", "TRUE":
@@ -249,6 +267,7 @@ func main() {
 		"keys_poll", cfg.KeysPollInterval,
 		"inline_tokens", cfg.InlineTokens,
 		"inline_idle", cfg.InlineIdle,
+		"batch_datagrams", cfg.BatchDatagrams,
 	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -304,7 +323,10 @@ func main() {
 	}
 
 	listenerErr := make(chan error, 1)
-	go func() { listenerErr <- listen(ctx, cfg.ListenPath, cfg.MaxEventBytes+1, reg, log, stats) }()
+	go func() {
+		listenerErr <- listenWithOptions(ctx, cfg.ListenPath, cfg.MaxEventBytes+1, reg, log, stats,
+			listenOptions{advertiseBatch: cfg.BatchDatagrams})
+	}()
 
 	select {
 	case <-ctx.Done():

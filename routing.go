@@ -326,6 +326,7 @@ func (r *registry) install() error {
 func (r *registry) demux() {
 	defer close(r.demuxDone)
 	for dg := range r.sharedRawCh {
+		n := dg.eventCount()
 		p, ok := r.lookup(dg.project)
 		if !ok {
 			// Project disappeared between dispatch and demux (SIGHUP
@@ -333,7 +334,7 @@ func (r *registry) demux() {
 			// as routing_closed rather than re-deriving the original
 			// missing/unknown reason — the datagram was successfully
 			// routed at dispatch time, the destination went away.
-			r.processStats.DropsRoutingClosed.Add(1)
+			r.processStats.DropsRoutingClosed.Add(n)
 			continue
 		}
 		delivered, closed, full := p.trySend(dg)
@@ -342,8 +343,8 @@ func (r *registry) demux() {
 			// nothing to account; batcher will bump pipelineStats after
 			// validateEvent succeeds.
 		case closed:
-			p.stats.DropsRoutingClosed.Add(1)
-			r.processStats.DropsRoutingClosed.Add(1)
+			p.stats.DropsRoutingClosed.Add(n)
+			r.processStats.DropsRoutingClosed.Add(n)
 		case full:
 			// Per-project handoff buffer overflow. Counted on the
 			// pipeline's own queue_full AND on the process-wide
@@ -353,8 +354,8 @@ func (r *registry) demux() {
 			// two apart lets operators tell "the whole agent is
 			// back-pressured" from "this one project's batcher/flusher is
 			// stuck."
-			p.stats.DropsQueueFull.Add(1)
-			r.processStats.DropsPipelineQueueFull.Add(1)
+			p.stats.DropsQueueFull.Add(n)
+			r.processStats.DropsPipelineQueueFull.Add(n)
 		}
 	}
 }
@@ -533,40 +534,119 @@ func (r *registry) lookup(project string) (*pipeline, bool) {
 // own handoff buffer is full (a single noisy project), distinct from
 // process-wide queue_full (shared queue exhausted).
 func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
+	if isBatchDatagram(dg.bytes) {
+		// A batch accounts its own events, including a full shared queue
+		// (n events, not the listener's one), so it never reports queueFull.
+		return r.dispatchBatch(dg), false
+	}
 	f := extractAndStripRouting(dg.bytes)
 	if f.malformed {
 		r.processStats.DropsParseError.Add(1)
 		return false, false
 	}
-	if f.badProject {
-		// `_project` was present but not a JSON string. JSON is structurally
-		// valid; the routing intent is unusable. Account as unrouted_unknown
-		// so an alert on that counter catches malformed client SDKs without
-		// conflating with broken-JSON parse_error.
-		r.processStats.DropsUnroutedUnknown.Add(1)
-		return false, false
-	}
-	project := f.project
 	if f.removed {
 		// Note this assignment happens for a stripped `_token` too, even on
 		// the drop paths below — the credential is out of the body before
 		// anything else can happen to it.
 		dg.bytes = f.stripped
 	}
-	if f.badToken && r.cfg.InlineTokens {
+	p, ok := r.route(&dg, f.project, f.token, f.badProject, f.badToken, 1)
+	if !ok {
+		return false, false
+	}
+	return r.enqueue(p, dg, 1)
+}
+
+// dispatchBatch routes a multi-event datagram (batch.go). Every event in it
+// is accounted individually: the listener counted the datagram as one
+// received event, so this adds the other n-1; a malformed member is one
+// parse_error; every routing-time drop and a full shared queue count once per
+// event. A batch that cannot be parsed is ONE parse_error, since its event
+// count is unknown.
+func (r *registry) dispatchBatch(dg rawDatagram) bool {
+	if !r.cfg.BatchDatagrams {
+		r.processStats.DropsParseError.Add(1)
+		return false
+	}
+	if r.cfg.MaxEventBytes > 0 && len(dg.bytes) > r.cfg.MaxEventBytes {
+		// Read at boundary+1, so it is truncated and would only fail to
+		// parse; count it as what it is.
+		r.processStats.DropsOversize.Add(1)
+		return false
+	}
+	bd, res := parseBatchDatagram(dg.bytes)
+	if res != batchParsed {
+		r.processStats.DropsParseError.Add(1)
+		return false
+	}
+	r.processStats.BatchDatagramsReceived.Add(1)
+	r.processStats.EventsReceived.Add(uint64(len(bd.events) - 1))
+
+	events := make([][]byte, 0, len(bd.events))
+	for _, ev := range bd.events {
+		// The header routes and authorizes every member. A member's own
+		// `_token` is stripped and ignored; a member `_project` must agree
+		// with the header's, and a member that disagrees (or names its
+		// project with a non-string) is malformed, never re-routed.
+		mf := extractAndStripRouting(ev)
+		if mf.malformed || mf.badProject || (mf.project != "" && mf.project != bd.project) {
+			r.processStats.DropsParseError.Add(1)
+			continue
+		}
+		if mf.removed {
+			if !json.Valid(mf.stripped) {
+				r.processStats.DropsParseError.Add(1)
+				continue
+			}
+			ev = mf.stripped
+		}
+		events = append(events, ev)
+	}
+	if len(events) == 0 {
+		return false
+	}
+	n := uint64(len(events))
+	dg.bytes = nil
+	dg.events = events
+
+	p, ok := r.route(&dg, bd.project, bd.token, bd.badProject, bd.badToken, n)
+	if !ok {
+		return false
+	}
+	delivered, full := r.enqueue(p, dg, n)
+	if full {
+		r.processStats.DropsQueueFull.Add(n)
+	}
+	return delivered
+}
+
+// route resolves the pipeline a datagram goes to and accounts every
+// routing-time drop as n events (1 for a single datagram, the event count for
+// a batch). On success it stamps dg.project and, with inline tokens on,
+// dg.token.
+func (r *registry) route(dg *rawDatagram, project, token string, badProject, badToken bool, n uint64) (*pipeline, bool) {
+	if badProject {
+		// `_project` was present but not a JSON string. JSON is structurally
+		// valid; the routing intent is unusable. Account as unrouted_unknown
+		// so an alert on that counter catches malformed client SDKs without
+		// conflating with broken-JSON parse_error.
+		r.processStats.DropsUnroutedUnknown.Add(n)
+		return nil, false
+	}
+	if badToken && r.cfg.InlineTokens {
 		// Present but unusable. NOT silently downgraded to the keys-file
 		// credential: a caller that meant to authenticate with a token and
 		// got the type wrong must not be quietly authorized as somebody
 		// else, and on an empty keys file that downgrade is a drop anyway.
-		r.processStats.DropsBadToken.Add(1)
-		return false, false
+		r.processStats.DropsBadToken.Add(n)
+		return nil, false
 	}
 	if r.cfg.InlineTokens {
-		dg.token = f.token
+		dg.token = token
 	}
 
 	p, ok := r.lookup(project)
-	if !ok && r.cfg.InlineTokens && f.token != "" && project != "" {
+	if !ok && r.cfg.InlineTokens && token != "" && project != "" {
 		// On-demand registration. A datagram that names a project AND
 		// carries its own credential needs no keys-file entry — the
 		// credential IS the authorization, and the gateway resolves the
@@ -576,11 +656,11 @@ func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
 	}
 	if !ok {
 		if project == "" {
-			r.processStats.DropsUnroutedMissing.Add(1)
+			r.processStats.DropsUnroutedMissing.Add(n)
 		} else {
-			r.processStats.DropsUnroutedUnknown.Add(1)
+			r.processStats.DropsUnroutedUnknown.Add(n)
 		}
-		return false, false
+		return nil, false
 	}
 	// An inline pipeline holds no credential of its own (see registerInline),
 	// so a datagram that routes there without carrying one cannot be
@@ -593,9 +673,9 @@ func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
 	// emits without one when its own minting fails, and the project stays
 	// registered from earlier traffic.
 	if p.inline && dg.token == "" {
-		p.stats.DropsMissingToken.Add(1)
-		r.processStats.DropsMissingToken.Add(1)
-		return false, false
+		p.stats.DropsMissingToken.Add(n)
+		r.processStats.DropsMissingToken.Add(n)
+		return nil, false
 	}
 	p.lastSeen.Store(dg.at.UnixNano())
 	// Early closed-pipeline check. If the pipeline was already drained at
@@ -609,13 +689,21 @@ func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
 	pclosed := p.closed
 	p.sendMu.RUnlock()
 	if pclosed {
-		p.stats.DropsRoutingClosed.Add(1)
-		r.processStats.DropsRoutingClosed.Add(1)
-		return false, false
+		p.stats.DropsRoutingClosed.Add(n)
+		r.processStats.DropsRoutingClosed.Add(n)
+		return nil, false
 	}
 	// Stamp project so the demuxer can route without re-parsing. May be ""
 	// when routing to DefaultProject — lookup() handles that case.
 	dg.project = project
+	return p, true
+}
+
+// enqueue hands a routed datagram to the shared queue. full=true means the
+// shared queue rejected it; the caller accounts that (the listener for a
+// single datagram, dispatchBatch for a batch). A shutdown in progress is a
+// routing_closed drop of n events.
+func (r *registry) enqueue(p *pipeline, dg rawDatagram, n uint64) (delivered bool, full bool) {
 	// Manual RUnlock (no defer) — this is the listener's hot path; the
 	// defer overhead is measurable here and the function is small enough
 	// that the early returns below are easy to audit by eye.
@@ -626,8 +714,8 @@ func (r *registry) dispatch(dg rawDatagram) (delivered bool, queueFull bool) {
 		// destination pipeline so this drop is attributable. Not
 		// queueFull (the queue may have had capacity; the agent is
 		// just exiting).
-		p.stats.DropsRoutingClosed.Add(1)
-		r.processStats.DropsRoutingClosed.Add(1)
+		p.stats.DropsRoutingClosed.Add(n)
+		r.processStats.DropsRoutingClosed.Add(n)
 		return false, false
 	}
 	select {
