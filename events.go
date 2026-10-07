@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // DefaultMaxEventBytes is the default per-datagram size ceiling for a JSON
@@ -119,9 +120,85 @@ func isJSONSpace(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\r' || c == '\n'
 }
 
-// hasTopLevelKey decodes the object with json.Decoder so we correctly skip
-// nested objects and strings.
+// hasTopLevelKey reports whether the JSON object b has a top-level member
+// named key (compared after unescaping, as encoding/json would). b must be
+// valid JSON: both callers check that first (validateEvent runs json.Valid;
+// a batch datagram's events come out of a body json.Decoder accepted).
+//
+// It walks the object with the routing layer's allocation-free scanner
+// (scanWS/scanValue) instead of a json.Decoder, which boxed every top-level
+// token and decoded every value into a fresh RawMessage once per event on
+// the batcher path. Anything the scanner does not accept (nesting deeper
+// than maxScanDepth, say) falls back to the decoder, so the answer never
+// changes; FuzzHasTopLevelKey pins the two against each other.
 func hasTopLevelKey(b []byte, key string) bool {
+	if found, ok := scanTopLevelKey(b, key); ok {
+		return found
+	}
+	return decodeTopLevelKey(b, key)
+}
+
+// scanTopLevelKey is hasTopLevelKey's fast path. ok=false means the scanner
+// could not walk b and the caller must ask the decoder.
+func scanTopLevelKey(b []byte, key string) (found, ok bool) {
+	i := scanWS(b, 0)
+	if i >= len(b) || b[i] != '{' {
+		return false, false
+	}
+	i = scanWS(b, i+1)
+	if i < len(b) && b[i] == '}' {
+		return false, true
+	}
+	for {
+		if i >= len(b) || b[i] != '"' {
+			return false, false
+		}
+		closeQuote, sok := scanStringBody(b, i+1)
+		if !sok {
+			return false, false
+		}
+		if keyEquals(b[i:closeQuote+1], key) {
+			return true, true
+		}
+		i = scanWS(b, closeQuote+1)
+		if i >= len(b) || b[i] != ':' {
+			return false, false
+		}
+		end, _, vok := scanValue(b, scanWS(b, i+1))
+		if !vok {
+			return false, false
+		}
+		i = scanWS(b, end)
+		if i >= len(b) {
+			return false, false
+		}
+		switch b[i] {
+		case ',':
+			i = scanWS(b, i+1)
+		case '}':
+			return false, true
+		default:
+			return false, false
+		}
+	}
+}
+
+// keyEquals compares a quoted JSON key (quotes included) with key after
+// unescaping. The common case, no escapes and valid UTF-8, compares the raw
+// bytes without allocating; anything else is unquoted exactly as
+// encoding/json would.
+func keyEquals(quoted []byte, key string) bool {
+	inner := quoted[1 : len(quoted)-1]
+	if bytes.IndexByte(inner, '\\') < 0 && utf8.Valid(inner) {
+		return string(inner) == key
+	}
+	s, ok := unquoteJSONString(quoted)
+	return ok && s == key
+}
+
+// decodeTopLevelKey is the json.Decoder walk hasTopLevelKey used before the
+// scanner; it remains the fallback.
+func decodeTopLevelKey(b []byte, key string) bool {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	tok, err := dec.Token()
 	if err != nil {
