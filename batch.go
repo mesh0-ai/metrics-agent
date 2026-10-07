@@ -20,16 +20,17 @@ import (
 //
 //	M0BATCH/1\n{"_project":"workspace-1","_token":"…","events":[{…},{…}]}
 //
-//   - The first line is the magic and the format version. It is not JSON on
-//     purpose: an agent that predates this format drops the datagram as one
-//     parse_error instead of forwarding `{"events":[…]}` as an event (which
-//     the gateway would refuse, failing every other event in its POST).
-//   - `_project` and `_token` route and authorize every event, exactly as on
-//     a single datagram; both are optional. No other header member is
-//     accepted.
-//   - Each event is one JSON object. A member's own `_token` is stripped and
-//     ignored (the header's authorizes it); a member `_project` must equal
-//     the header's, else that member is dropped as parse_error.
+// The first line is the magic and the format version. It is not JSON on
+// purpose: an agent that predates this format drops the datagram as one
+// parse_error instead of forwarding `{"events":[…]}` as an event (which the
+// gateway would refuse, failing every other event in its POST).
+//
+// `_project` and `_token` route and authorize every event, exactly as on a
+// single datagram; both are optional. No other header member is accepted.
+//
+// Each event is one JSON object. A member's own `_token` is stripped and
+// ignored (the header's authorizes it); a member `_project` must equal the
+// header's, else that member is dropped as parse_error.
 //
 // An emitter must not send one unless the agent advertises it: on bind the
 // agent writes `<listen path>.caps` naming the formats it accepts and the

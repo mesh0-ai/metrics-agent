@@ -88,13 +88,13 @@ type Config struct {
 
 func loadConfig() (Config, error) {
 	c := Config{
-		APIKey:        os.Getenv("MESH0_API_KEY"),
-		KeysFile:      os.Getenv("MESH0_KEYS_FILE"),
-		GatewayURL:    envOr("MESH0_BASE_URL", "https://api.mesh0.ai"),
-		EventsPath:    envOr("MESH0_EVENTS_PATH", "/v1/events"),
-		ListenPath:    envOr("MESH0_LISTEN_PATH", "/run/mesh0/agent.sock"),
-		HealthAddr:    envOr("MESH0_HEALTH_ADDR", ":8126"),
-		BatchWindow:   200 * time.Millisecond,
+		APIKey:      os.Getenv("MESH0_API_KEY"),
+		KeysFile:    os.Getenv("MESH0_KEYS_FILE"),
+		GatewayURL:  envOr("MESH0_BASE_URL", "https://api.mesh0.ai"),
+		EventsPath:  envOr("MESH0_EVENTS_PATH", "/v1/events"),
+		ListenPath:  envOr("MESH0_LISTEN_PATH", "/run/mesh0/agent.sock"),
+		HealthAddr:  envOr("MESH0_HEALTH_ADDR", ":8126"),
+		BatchWindow: 200 * time.Millisecond,
 		// 2000 of the gateway's 5000: under load the old 500 capped every
 		// POST, so the default set the POST rate. Bodies stay within
 		// MaxBatchBytes (10 MB), which pre-flushes a batch of large events.

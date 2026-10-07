@@ -14,21 +14,21 @@ type selfStats struct {
 	// datagram's event count (the listener counts the datagram as one, and
 	// dispatchBatch adds the rest), so the reconciliation below holds either
 	// way.
-	EventsReceived   atomic.Uint64
+	EventsReceived atomic.Uint64
 	// BatchDatagramsReceived counts multi-event datagrams accepted for
 	// routing (batch.go).
 	BatchDatagramsReceived atomic.Uint64
-	EventsSent       atomic.Uint64
-	BatchesSent      atomic.Uint64
-	DropsParseError  atomic.Uint64
-	DropsQueueFull   atomic.Uint64
+	EventsSent             atomic.Uint64
+	BatchesSent            atomic.Uint64
+	DropsParseError        atomic.Uint64
+	DropsQueueFull         atomic.Uint64
 	// DropsPipelineQueueFull is the process-wide total of per-project
 	// handoff overflows (the sum of by_project queue_full). DropsQueueFull
 	// above counts only the SHARED queue; before this counter existed a
 	// per-project overflow was invisible at the top level.
 	DropsPipelineQueueFull atomic.Uint64
-	DropsOversize    atomic.Uint64
-	DropsFlushFailed atomic.Uint64
+	DropsOversize          atomic.Uint64
+	DropsFlushFailed       atomic.Uint64
 	// DropsNotAccepted counts events the gateway answered 2xx for but did
 	// not accept: a batch refused until retries ran out (mesh0's
 	// `202 {"accepted":0}` while a project provisions), or the shortfall of
@@ -78,19 +78,19 @@ func newSelfStats() *selfStats {
 
 // statsSnapshot is the JSON shape of GET /stats.
 type statsSnapshot struct {
-	EventsReceived uint64                          `json:"events_received"`
+	EventsReceived uint64 `json:"events_received"`
 	// BatchDatagramsReceived is how many of those arrived in multi-event
 	// datagrams, counted per datagram.
-	BatchDatagramsReceived uint64 `json:"batch_datagrams_received,omitempty"`
-	EventsDropped  dropStats                       `json:"events_dropped"`
-	BatchesSent    uint64                          `json:"batches_sent"`
-	EventsSent     uint64                          `json:"events_sent"`
-	LastFlushAgeMs int64                           `json:"last_flush_age_ms"`
-	ReadErrors     uint64                          `json:"read_errors"`
-	BufferDegraded bool                            `json:"buffer_degraded"`
-	ListenerFatal  bool                            `json:"listener_fatal"`
-	UptimeS        int64                           `json:"uptime_s"`
-	ByProject      map[string]projectStatsSnapshot `json:"by_project,omitempty"`
+	BatchDatagramsReceived uint64                          `json:"batch_datagrams_received,omitempty"`
+	EventsDropped          dropStats                       `json:"events_dropped"`
+	BatchesSent            uint64                          `json:"batches_sent"`
+	EventsSent             uint64                          `json:"events_sent"`
+	LastFlushAgeMs         int64                           `json:"last_flush_age_ms"`
+	ReadErrors             uint64                          `json:"read_errors"`
+	BufferDegraded         bool                            `json:"buffer_degraded"`
+	ListenerFatal          bool                            `json:"listener_fatal"`
+	UptimeS                int64                           `json:"uptime_s"`
+	ByProject              map[string]projectStatsSnapshot `json:"by_project,omitempty"`
 	// KeysReloadFailures and LastKeysReloadUnix surface the health of the
 	// SIGHUP keys-file reload path. A non-zero failure count with a stale
 	// LastKeysReloadUnix means operators are running on an outdated table.
@@ -107,21 +107,21 @@ type statsSnapshot struct {
 }
 
 type dropStats struct {
-	ParseError      uint64 `json:"parse_error"`
-	QueueFull       uint64 `json:"queue_full"`
+	ParseError uint64 `json:"parse_error"`
+	QueueFull  uint64 `json:"queue_full"`
 	// PipelineQueueFull is top-level only: the per-project overflows,
 	// summed. Zero (and omitted) in a by_project entry, whose own
 	// queue_full already is that project's overflow.
 	PipelineQueueFull uint64 `json:"pipeline_queue_full,omitempty"`
-	Oversize        uint64 `json:"oversize"`
-	FlushFailed     uint64 `json:"flush_failed"`
-	NotAccepted     uint64 `json:"not_accepted"`
-	Shutdown        uint64 `json:"shutdown"`
-	RoutingClosed   uint64 `json:"routing_closed,omitempty"`
-	UnroutedMissing uint64 `json:"unrouted_missing_project,omitempty"`
-	UnroutedUnknown uint64 `json:"unrouted_unknown_project,omitempty"`
-	BadToken        uint64 `json:"bad_token,omitempty"`
-	MissingToken    uint64 `json:"missing_token,omitempty"`
+	Oversize          uint64 `json:"oversize"`
+	FlushFailed       uint64 `json:"flush_failed"`
+	NotAccepted       uint64 `json:"not_accepted"`
+	Shutdown          uint64 `json:"shutdown"`
+	RoutingClosed     uint64 `json:"routing_closed,omitempty"`
+	UnroutedMissing   uint64 `json:"unrouted_missing_project,omitempty"`
+	UnroutedUnknown   uint64 `json:"unrouted_unknown_project,omitempty"`
+	BadToken          uint64 `json:"bad_token,omitempty"`
+	MissingToken      uint64 `json:"missing_token,omitempty"`
 }
 
 // pipelineStats tracks the per-project subset of counters. These count
@@ -214,15 +214,15 @@ func (s *selfStats) snapshot() statsSnapshot {
 			ParseError:        s.DropsParseError.Load(),
 			QueueFull:         s.DropsQueueFull.Load(),
 			PipelineQueueFull: s.DropsPipelineQueueFull.Load(),
-			Oversize:        s.DropsOversize.Load(),
-			FlushFailed:     s.DropsFlushFailed.Load(),
-			NotAccepted:     s.DropsNotAccepted.Load(),
-			Shutdown:        s.DropsShutdown.Load(),
-			RoutingClosed:   s.DropsRoutingClosed.Load(),
-			UnroutedMissing: s.DropsUnroutedMissing.Load(),
-			UnroutedUnknown: s.DropsUnroutedUnknown.Load(),
-			BadToken:        s.DropsBadToken.Load(),
-			MissingToken:    s.DropsMissingToken.Load(),
+			Oversize:          s.DropsOversize.Load(),
+			FlushFailed:       s.DropsFlushFailed.Load(),
+			NotAccepted:       s.DropsNotAccepted.Load(),
+			Shutdown:          s.DropsShutdown.Load(),
+			RoutingClosed:     s.DropsRoutingClosed.Load(),
+			UnroutedMissing:   s.DropsUnroutedMissing.Load(),
+			UnroutedUnknown:   s.DropsUnroutedUnknown.Load(),
+			BadToken:          s.DropsBadToken.Load(),
+			MissingToken:      s.DropsMissingToken.Load(),
 		},
 		BatchesSent:    s.BatchesSent.Load(),
 		EventsSent:     s.EventsSent.Load(),
